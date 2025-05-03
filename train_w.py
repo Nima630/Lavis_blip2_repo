@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 from lavis.datasets.waymo import WaymoDatasetBuilder
-
+# from lavis.datasets.waymo_pointNet import WaymoDatasetBuilder
 from lavis.models.blip2_models.blip2_qformer_w import Blip2Qformer  # ✅ your custom model
 from lavis.tasks.base_task_w import BaseTask
 from lavis.common.config_w import Config  # ✅ your new config_w.py
@@ -20,6 +20,11 @@ from lavis.common.utils import now
 # Optional: if you're keeping runners for now
 from lavis.runners.runner_base_w import RunnerBaseW
 from torch.utils.data import DataLoader
+from omegaconf import OmegaConf
+from lavis.common.registry import registry
+import sys
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Training")
     parser.add_argument("--cfg-path", required=True, help="Path to YAML config.")
@@ -49,7 +54,18 @@ def main():
     cfg.run_cfg.gpu = int(os.environ.get("LOCAL_RANK", 0))
     setup_seeds(cfg)
     setup_logger()
-    print("[TRACE] Config initialized")
+
+    # Manually register the paths previously set in lavis/tasks/__init__.py
+    root_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lavis")
+
+
+    registry.register_path("library_root", root_dir)
+    repo_root = os.path.join(root_dir, "..")
+    registry.register_path("repo_root", repo_root)
+
+
+    registry.register("MAX_INT", sys.maxsize)
+    registry.register("SPLIT_NAMES", ["train", "val", "test"])
 
     print(cfg.run_cfg)
     print("cfg.run_cfg")

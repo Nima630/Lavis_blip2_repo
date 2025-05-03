@@ -46,7 +46,7 @@ class RunnerBaseW:
     """
 
     def __init__(self, cfg, task, model, datasets, job_id):
-        print("[TRACE] runner_base.py")
+        # print("[TRACE] runner_base.py")
         self.config = cfg
         self.job_id = job_id
 
@@ -252,12 +252,12 @@ class RunnerBaseW:
             collate_fns = []
             for dataset in datasets:
                 if isinstance(dataset, (tuple, list)):
-                    print(f"[DEBUG] Dataset is a tuple/list with {len(dataset)} items")
-                    for d in dataset:
-                        print(f"    - Sub-dataset type: {type(d)}, length: {len(d) if hasattr(d, '__len__') else 'unknown'}")
+                    # print(f"[DEBUG] Dataset is a tuple/list with {len(dataset)} items")
+                    # for d in dataset:
+                    #     print(f"    - Sub-dataset type: {type(d)}, length: {len(d) if hasattr(d, '__len__') else 'unknown'}")
                     collate_fns.append([getattr(d, "collater", None) for d in dataset])
                 else:
-                    print(f"[DEBUG] Dataset type: {type(dataset)}, length: {len(dataset) if hasattr(dataset, '__len__') else 'unknown'}")
+                    # print(f"[DEBUG] Dataset type: {type(dataset)}, length: {len(dataset) if hasattr(dataset, '__len__') else 'unknown'}")
                     collate_fns.append(getattr(dataset, "collater", None))
 
 
@@ -282,17 +282,17 @@ class RunnerBaseW:
             # print("[DEBUG] Created dataloaders:")
 
             for split_name, loader in self._dataloaders.items():
-                print(f"  • Split: '{split_name}'")
-                print(f"    - Loader type: {type(loader)}")
+                # print(f"  • Split: '{split_name}'")
+                # print(f"    - Loader type: {type(loader)}")
 
                 # If loader is IterLoader, try to access the underlying dataloader
                 inner_loader = getattr(loader, 'loader', None)
 
                 if inner_loader is not None:
-                    print(f"    - Underlying dataset type: {type(inner_loader.dataset)}")
+                    # print(f"    - Underlying dataset type: {type(inner_loader.dataset)}")
                     try:
                         dataset_length = len(inner_loader.dataset)
-                        print(f"    - Dataset length: {dataset_length}")
+                        # print(f"    - Dataset length: {dataset_length}")
                         if dataset_length == 0:
                             raise RuntimeError(f"Error: Dataset for split '{split_name}' is empty! Please check your data paths or preprocessing.")
                     # except:
@@ -303,7 +303,7 @@ class RunnerBaseW:
                     try:
                         sample_batch = next(iter(inner_loader))
                         sample_keys = sample_batch.keys() if isinstance(sample_batch, dict) else type(sample_batch)
-                        print(f"    - Sample batch keys: {sample_keys}")
+                        # print(f"    - Sample batch keys: {sample_keys}")
                     except Exception as e:
                         print(f"    - Could not preview batch: {e}")
                 else:
@@ -412,7 +412,8 @@ class RunnerBaseW:
 
         self.result_dir = result_dir
         self.output_dir = output_dir
-
+    
+    # performs train, val, test
     def train(self):
         start_time = time.time()
         # best_agg_metric = 0
@@ -422,19 +423,15 @@ class RunnerBaseW:
         self.log_config()
 
         # resume from checkpoint if specified
-        if not self.evaluate_only and self.resume_ckpt_path is not None:
+        # if not self.evaluate_only and self.resume_ckpt_path is not None:
+        if self.resume_ckpt_path is not None:
+            print("loding model ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
             self._load_checkpoint(self.resume_ckpt_path)
 
         for cur_epoch in range(self.start_epoch, self.max_epoch):
             # training phase
             if not self.evaluate_only:
                 logging.info("Start training")
-                # See https://github.com/salesforce/LAVIS/issues/449
-                # if cur_epoch == self.start_epoch:
-                #     self.task.before_training(
-                #         model=self.unwrap_dist_model(self.model),
-                #         dataset=self.datasets["train"],
-                #     )
                 train_stats = self.train_epoch(cur_epoch)
                 self.log_stats(split_name="train", stats=train_stats)
 
@@ -444,75 +441,51 @@ class RunnerBaseW:
                     logging.info("Evaluating on {}.".format(split_name))
                     
                     val_log = self.eval_epoch(
-                        split_name=split_name, cur_epoch=cur_epoch
-                    )
+                        split_name=split_name, cur_epoch=cur_epoch)
 
-                    # if val_log is not None:
-                    #     if is_main_process():
-                    #         assert (
-                    #             "agg_metrics" in val_log
-                    #         ), "No agg_metrics found in validation log."
-                    #         agg_metrics = val_log["agg_metrics"]
-                    #         if agg_metrics > best_agg_metric and split_name == "val":
-                    #             best_epoch, best_agg_metric = cur_epoch, agg_metrics
-                    #             if not self.evaluate_only:
-                    #                 self._save_checkpoint(cur_epoch, is_best=True)
-                            
 
                     if val_log is not None:
                         if is_main_process():
-                            if "loss" in val_log:
-                                current_val_loss = val_log["loss"]
-                                if current_val_loss < best_val_loss_so_far and split_name == "val":
-                                    best_epoch, best_val_loss_so_far = cur_epoch, current_val_loss
-                                    if not self.evaluate_only:
-                                        self._save_checkpoint(cur_epoch, is_best=True)
-                            else:
-                                # If no "loss" found, fallback to save checkpoint anyway
+                            current_val_loss = val_log["loss"]
+                            if current_val_loss < best_val_loss_so_far and split_name == "val":
+                                best_epoch, best_val_loss_so_far = cur_epoch, current_val_loss
                                 if not self.evaluate_only:
-                                    self._save_checkpoint(cur_epoch, is_best=True)
-
+                                    self._save_checkpoint(cur_epoch, is_best=True) 
+                        
                             val_log.update({"best_epoch": best_epoch})
                             self.log_stats(val_log, split_name)
-
-
-
-            else:
-                # if no validation split is provided, we just save the checkpoint at the end of each epoch.
-                if not self.evaluate_only:
-                    self._save_checkpoint(cur_epoch, is_best=False)
 
             if self.evaluate_only:
                 break
 
-            # save checkpoint according to save freq
-            if self.save_freq>0 and cur_epoch%self.save_freq == 0:
-                self._save_checkpoint(cur_epoch, is_best=False)
+            # commented because no no enough memory for saving models
+            #   
+            # # If no validation or regardless of it, save based on save frequency
+            # if not self.evaluate_only and self.save_freq > 0 and cur_epoch % self.save_freq == 0:
+            #     self._save_checkpoint(cur_epoch, is_best=False)
 
-            # dist.barrier()
-
+            
             if dist.is_available() and dist.is_initialized():
                 dist.barrier()
-
-        # save last checkpoint
-        if self.save_last and not self.evaluate_only:
-            self._save_checkpoint(cur_epoch, is_best=False)
-
+        # if no validation, save the last model
         best_checkpoint_path = os.path.join(self.output_dir, "checkpoint_best.pth")
         if not os.path.exists(best_checkpoint_path):
             logging.info("No best checkpoint found. Saving last model as best.")
             self._save_checkpoint(cur_epoch, is_best=True)
 
         # testing phase
-        test_epoch = "best" if len(self.valid_splits) > 0 else cur_epoch
-        self.evaluate(cur_epoch=test_epoch, skip_reload=self.evaluate_only)
-
-        total_time = time.time() - start_time
-        total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-        logging.info("Training time {}".format(total_time_str))
+        # test_epoch = "best" if len(self.valid_splits) > 0 else cur_epoch
+        # test_logs = self.evaluate(cur_epoch=test_epoch, skip_reload=self.evaluate_only)
+        # if is_main_process():
+        #     for split_name, split_log in test_logs.items():
+        #         self.log_stats(split_log, split_name)
+        # print(test_logs["test"])
+        # total_time = time.time() - start_time
+        # total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+        # logging.info("Training time {}".format(total_time_str))
 
                     
-
+    # testing phase
     def evaluate(self, cur_epoch="best", skip_reload=False): # --------------------------------------------------------------------------------- 
         test_logs = dict()
 
@@ -564,18 +537,21 @@ class RunnerBaseW:
             model = self._reload_best_model(model)
         model.eval()
 
-        self.task.before_evaluation(
+        self.task.before_evaluation( # DistributedDataParallel setup wrapper
             model=model,
             dataset=self.datasets[split_name],
         )
-        results = self.task.evaluation(model, data_loader)
+        results = self.task.evaluation(self.config, model, data_loader)
 
         if results is not None:
-            return self.task.after_evaluation(
+            output = self.task.after_evaluation(self.config, 
                 val_result=results,
                 split_name=split_name,
                 epoch=cur_epoch,
             )
+            return output
+        else:
+            return None
 
     def unwrap_dist_model(self, model):
         if self.use_distributed:
@@ -598,20 +574,20 @@ class RunnerBaseW:
         """
 
         def _create_loader(dataset, num_workers, bsz, is_train, collate_fn):
-            print("\n[LOADER DEBUG] Starting _create_loader")
-            print(f"  • Dataset object: {dataset}")
-            print(f"  • Dataset type: {type(dataset)}")
+            # print("\n[LOADER DEBUG] Starting _create_loader")
+            # print(f"  • Dataset object: {dataset}")
+            # print(f"  • Dataset type: {type(dataset)}")
             try:
                 print(f"  • Dataset length: {len(dataset)}")
             except Exception as e:
                 print(f"  • Dataset length: unknown ({e})")
 
-            print(f"  • Batch size: {bsz}")
-            print(f"  • Is training: {is_train}")
-            print(f"  • Collate function: {collate_fn}")
+            # print(f"  • Batch size: {bsz}")
+            # print(f"  • Is training: {is_train}")
+            # print(f"  • Collate function: {collate_fn}")
 
             if isinstance(dataset, ChainDataset) or isinstance(dataset, wds.DataPipeline):
-                print("[LOADER DEBUG] Detected streaming-style dataset (ChainDataset or wds.DataPipeline)")
+                # print("[LOADER DEBUG] Detected streaming-style dataset (ChainDataset or wds.DataPipeline)")
                 loader = iter(
                     DataLoader(
                         dataset,
@@ -620,7 +596,7 @@ class RunnerBaseW:
                         pin_memory=True,
                     )
                 )
-                print("[LOADER DEBUG] Created iterable DataLoader for streaming-style dataset")
+                # print("[LOADER DEBUG] Created iterable DataLoader for streaming-style dataset")
             else:
                 if self.use_distributed:
                     sampler = DistributedSampler(
@@ -634,14 +610,14 @@ class RunnerBaseW:
                 else:
                     sampler = None
 
-                print("[LOADER DEBUG] Creating torch.utils.data.DataLoader with:")
-                print(f"    - batch_size = {bsz}")
-                print(f"    - num_workers = {num_workers}")
-                print(f"    - pin_memory = True")
-                print(f"    - sampler = {sampler}")
-                print(f"    - shuffle = {sampler is None and is_train}")
-                print(f"    - drop_last = {is_train}")
-                print(f"    - collate_fn = {collate_fn}")
+                # print("[LOADER DEBUG] Creating torch.utils.data.DataLoader with:")
+                # print(f"    - batch_size = {bsz}")
+                # print(f"    - num_workers = {num_workers}")
+                # print(f"    - pin_memory = True")
+                # print(f"    - sampler = {sampler}")
+                # print(f"    - shuffle = {sampler is None and is_train}")
+                # print(f"    - drop_last = {is_train}")
+                # print(f"    - collate_fn = {collate_fn}")
 
                 loader = DataLoader(
                     dataset,
@@ -653,24 +629,24 @@ class RunnerBaseW:
                     collate_fn=collate_fn,
                     drop_last=True if is_train else False,
                 )
-                print(f"[LOADER DEBUG] DataLoader created: {loader}")
+                # print(f"[LOADER DEBUG] DataLoader created: {loader}")
                 loader = PrefetchLoader_(loader)
-                print(f"[LOADER DEBUG] Wrapped in PrefetchLoader: {type(loader)}")
+                # print(f"[LOADER DEBUG] Wrapped in PrefetchLoader: {type(loader)}")
 
                 if is_train:
                     loader = IterLoader(loader, use_distributed=self.use_distributed)
-                    print(f"[LOADER DEBUG] Wrapped in IterLoader: {type(loader)}")
+                    # print(f"[LOADER DEBUG] Wrapped in IterLoader: {type(loader)}")
 
-            print("[LOADER DEBUG] Finished creating loader\n")
+            # print("[LOADER DEBUG] Finished creating loader\n")
             return loader
 
         loaders = []
 
         for dataset, bsz, is_train, collate_fn in zip(datasets, batch_sizes, is_trains, collate_fns):
             # print("\n[DEBUG] Creating loader...")
-            print(f"  • Raw dataset input: {dataset}")
-            print(f"  • Dataset type: {type(dataset)}")
-            print(f"  • Is training split: {is_train}")
+            # print(f"  • Raw dataset input: {dataset}")
+            # print(f"  • Dataset type: {type(dataset)}")
+            # print(f"  • Is training split: {is_train}")
 
             if isinstance(dataset, list) or isinstance(dataset, tuple):
                 # print(f"[DEBUG] Creating MultiIterLoader from {len(dataset)} sub-datasets...")
@@ -743,29 +719,76 @@ class RunnerBaseW:
             model.load_state_dict(checkpoint["model"], strict=False)
         return model
 
-    def _load_checkpoint(self, url_or_filename): #----------------------------------------------------------------------------------
+
+    def _load_checkpoint(self, url_or_filename):
         """
         Resume from a checkpoint.
         """
+        print(f"[DEBUG] Attempting to load checkpoint: {url_or_filename}")
+
         if is_url(url_or_filename):
+            print("[DEBUG] Detected URL, downloading checkpoint...")
             cached_file = download_cached_file(
                 url_or_filename, check_hash=False, progress=True
             )
+            print(f"[DEBUG] Download complete. Loading checkpoint from cache: {cached_file}")
             checkpoint = torch.load(cached_file, map_location=self.device)
+
         elif os.path.isfile(url_or_filename):
+            print(f"[DEBUG] Found local checkpoint file: {url_or_filename}")
             checkpoint = torch.load(url_or_filename, map_location=self.device)
         else:
+            print("[ERROR] Checkpoint path is invalid.")
             raise RuntimeError("checkpoint url or path is invalid")
 
-        state_dict = checkpoint["model"]
-        self.unwrap_dist_model(self.model).load_state_dict(state_dict)
+        print("[DEBUG] Checkpoint loaded successfully.")
+        print(f"[DEBUG] Keys in checkpoint: {list(checkpoint.keys())}")
 
+        state_dict = checkpoint["model"]
+        print("[DEBUG] Loading model state dict...")
+        # self.unwrap_dist_model(self.model).load_state_dict(state_dict)
+        missing_keys, unexpected_keys = self.unwrap_dist_model(self.model).load_state_dict(state_dict, strict=False)
+        print("[DEBUG] Missing keys:", missing_keys)
+        print("[DEBUG] Unexpected keys:", unexpected_keys)
+
+
+        print("[DEBUG] Loading optimizer state dict...")
         self.optimizer.load_state_dict(checkpoint["optimizer"])
+
         if self.scaler and "scaler" in checkpoint:
+            print("[DEBUG] Loading AMP scaler state dict...")
             self.scaler.load_state_dict(checkpoint["scaler"])
+        else:
+            print("[DEBUG] No AMP scaler state found in checkpoint.")
 
         self.start_epoch = checkpoint["epoch"] + 1
+        print(f"[DEBUG] Resuming from epoch {self.start_epoch}")
         logging.info("Resume checkpoint from {}".format(url_or_filename))
+
+
+    # def _load_checkpoint(self, url_or_filename): #----------------------------------------------------------------------------------
+    #     """
+    #     Resume from a checkpoint.
+    #     """
+    #     if is_url(url_or_filename):
+    #         cached_file = download_cached_file(
+    #             url_or_filename, check_hash=False, progress=True
+    #         )
+    #         checkpoint = torch.load(cached_file, map_location=self.device)
+    #     elif os.path.isfile(url_or_filename):
+    #         checkpoint = torch.load(url_or_filename, map_location=self.device)
+    #     else:
+    #         raise RuntimeError("checkpoint url or path is invalid")
+
+    #     state_dict = checkpoint["model"]
+    #     self.unwrap_dist_model(self.model).load_state_dict(state_dict)
+
+    #     self.optimizer.load_state_dict(checkpoint["optimizer"])
+    #     if self.scaler and "scaler" in checkpoint:
+    #         self.scaler.load_state_dict(checkpoint["scaler"])
+
+    #     self.start_epoch = checkpoint["epoch"] + 1
+    #     logging.info("Resume checkpoint from {}".format(url_or_filename))
 
     @main_process
     def log_stats(self, stats, split_name):

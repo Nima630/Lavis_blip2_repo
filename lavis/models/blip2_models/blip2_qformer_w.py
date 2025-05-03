@@ -117,7 +117,7 @@ class Blip2Qformer(Blip2Base):
         # print("LiDAR shape:", lidar.shape)
         
         bs = image.size(0)
-        print("bs = image.size(0)", bs)
+        # print("bs = image.size(0)", bs)
 
         if dist.is_available() and dist.is_initialized():
             rank = dist.get_rank()
@@ -242,7 +242,7 @@ class Blip2Qformer(Blip2Base):
         #     F.cross_entropy(sim_r2l, targets, label_smoothing=0.1) +
         #     F.cross_entropy(sim_l2r, targets, label_smoothing=0.1)
         # ) / 2
-        print("passed the loss_contrastive -----------------------------------------------------------------------")
+        # print("passed the loss_contrastive -----------------------------------------------------------------------")
         
         
         
@@ -282,19 +282,81 @@ class Blip2Qformer(Blip2Base):
         # print("passed the total_loss -----------------------------------------------------------------------")
         return BlipOutput(
             loss=loss_contrastive,
-            loss_itc=loss_contrastive,
+            # loss_itc=loss_contrastive,
         )
 
 
-
-    def forward_2(self, samples):
-        print("[MODEL DEBUG] Input sample keys:", samples.keys())
-        print("[MODEL DEBUG] image shape:", samples["image"].shape)
-        print("[MODEL DEBUG] lidar shape:", samples.get("lidar", "MISSING"))
+    def forward_(self, samples):
         image = samples["image"]
         lidar = samples["lidar"]
-        labels = samples["label"]  # 1 = match, 0 = mismatch
+        
+        bs = image.size(0)
 
+        if dist.is_available() and dist.is_initialized():
+            rank = dist.get_rank()
+        else:
+            rank = 0  # or None if rank isn’t needed for your logic
+
+        # rank = dist.get_rank()
+
+        # === Encode Camera (RGB) ===
+        rgb_embeds = self.ln_vision(self.visual_encoder(image))
+        rgb_atts = torch.ones(rgb_embeds.size()[:-1], dtype=torch.long).to(image.device)
+        query_tokens = self.query_tokens.expand(bs, -1, -1)
+
+        rgb_query_output = self.Qformer.bert(
+            query_embeds=query_tokens,
+            encoder_hidden_states=rgb_embeds,
+            encoder_attention_mask=rgb_atts,
+            return_dict=True,
+        )
+        rgb_feats = F.normalize(self.vision_proj(rgb_query_output.last_hidden_state), dim=-1)
+
+        # === Encode LiDAR ===
+        lidar_embeds = self.ln_lidar(self.lidar_encoder(lidar))
+        lidar_atts = torch.ones(lidar_embeds.size()[:-1], dtype=torch.long).to(lidar.device)
+        query_tokens_lidar = self.query_tokens_lidar.expand(bs, -1, -1)
+        
+        lidar_query_output = self.Qformer_lidar.bert(
+            query_embeds=query_tokens_lidar,
+            encoder_hidden_states=lidar_embeds,
+            encoder_attention_mask=lidar_atts,
+            return_dict=True,
+        )
+        lidar_feats = F.normalize(self.lidar_proj(lidar_query_output.last_hidden_state), dim=-1)
+        rgb_feats_all = concat_all_gather(rgb_feats)
+        lidar_feats_all = concat_all_gather(lidar_feats)
+
+        B, N, D = rgb_feats_all.shape  # [B, N, D]
+
+        # Flatten for einsum
+        rgb_feats_flat = rgb_feats_all  # [B, N, D]
+        lidar_feats_flat = lidar_feats_all  # [B, N, D]
+
+
+        # Output shape: [B, B, N, N]
+        dot_products = torch.einsum('bnd,tmd->btmn', rgb_feats_flat, lidar_feats_flat)
+        # RGB→LiDAR
+        sim_rgb2lidar = dot_products.max(dim=-1).values.mean(dim=-1)  # shape [B, B]
+
+        # LiDAR→RGB
+        sim_lidar2rgb = dot_products.max(dim=-2).values.mean(dim=-1)  # shape [B, B]
+        targets = torch.arange(B).to(sim_rgb2lidar.device)  # [0, 1, ..., B-1]
+
+        loss_contrastive = (
+            F.cross_entropy(sim_rgb2lidar, targets, label_smoothing=0.1) +
+            F.cross_entropy(sim_lidar2rgb, targets, label_smoothing=0.1)
+        ) / 2
+        return BlipOutput(
+            loss=loss_contrastive,
+            
+        )
+
+
+    @torch.no_grad()
+    def forward_features(self, samples):
+        image = samples["image"]
+        lidar = samples["lidar"]
         bs = image.size(0)
 
         # === Encode RGB ===
@@ -313,55 +375,20 @@ class Blip2Qformer(Blip2Base):
         # === Encode LiDAR ===
         lidar_embeds = self.ln_lidar(self.lidar_encoder(lidar))
         lidar_atts = torch.ones(lidar_embeds.size()[:-1], dtype=torch.long).to(lidar.device)
+        query_tokens_lidar = self.query_tokens_lidar.expand(bs, -1, -1)
+
         lidar_query_output = self.Qformer_lidar.bert(
-            query_embeds=query_tokens,
+            query_embeds=query_tokens_lidar,
             encoder_hidden_states=lidar_embeds,
             encoder_attention_mask=lidar_atts,
             return_dict=True,
         )
         lidar_feats = F.normalize(self.lidar_proj(lidar_query_output.last_hidden_state), dim=-1)
-
-        # === Contrastive Loss ===
-        rgb_feats_all = concat_all_gather(rgb_feats)
-        lidar_feats_all = concat_all_gather(lidar_feats)
-
-        sim_r2l = torch.matmul(rgb_feats.unsqueeze(1), lidar_feats_all.unsqueeze(-1)).squeeze().max(-1)[0]
-        sim_l2r = torch.matmul(lidar_feats.unsqueeze(1), rgb_feats_all.unsqueeze(-1)).squeeze().max(-1)[0]
-
-        sim_r2l = sim_r2l / self.temp
-        sim_l2r = sim_l2r / self.temp
-
-
-        if dist.is_available() and dist.is_initialized():
-            rank = dist.get_rank()
-        else:
-            rank = 0  # or None if rank isn’t needed for your logic
-
-
-        # rank = dist.get_rank()
-        targets = torch.linspace(rank * bs, rank * bs + bs - 1, bs, dtype=int).to(image.device)
-
-        loss_contrastive = (
-            F.cross_entropy(sim_r2l, targets, label_smoothing=0.1) +
-            F.cross_entropy(sim_l2r, targets, label_smoothing=0.1)
-        ) / 2
-
-        # === Matching Head (Binary Classifier) ===
-        fused_feats = torch.cat([rgb_feats.mean(dim=1), lidar_feats.mean(dim=1)], dim=-1)
-        logits_match = self.matching_head(fused_feats).squeeze()  # Output shape: [batch]
-        loss_match = F.binary_cross_entropy_with_logits(logits_match, labels)
-
-        # === Return both losses ===
-        total_loss = loss_contrastive + loss_match  # You can weight them if needed
-
-        return BlipOutput(
-            loss=total_loss,
-            loss_itc=loss_contrastive,
-            loss_itm=loss_match,
-            loss_lm=torch.tensor(0.0).to(image.device),
-        )
-
-
+        print("----------------   lidar_feats shape", lidar_feats.shape)
+        return {
+            "rgb_feats": rgb_feats,         # [B, N, D]
+            "lidar_feats": lidar_feats      # [B, N, D]
+        }
 
     @classmethod
     def from_config(cls, cfg): # ----------------------------------------------------------------------------

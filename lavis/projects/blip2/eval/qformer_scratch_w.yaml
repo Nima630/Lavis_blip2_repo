@@ -61,7 +61,7 @@ datasets:
 
 
 run:
-  retrieval_eval: false 
+  retrieval_eval: true  # only set this in testing mode
   task: waymo_captioning  # <- custom task if you register it
   lr_sched: "linear_warmup_cosine_lr" #   linear_warmup_step_lr
   # lr_decay_rate: 0.9 
@@ -79,14 +79,14 @@ run:
   accum_grad_iters: 8 # batch_size_train x accum_grad_iters = effective batch size 
   warmup_steps: 50 #20 #5
   seed: 42
-  output_dir: "output/BLIP2/qformer_scratch_waymo_full_ttt"
+  output_dir: "output/BLIP2/qformer_scratch_waymo_full_ttt_eval"
   amp:  true
   # only uncommented when resuming traning or when evaluate only (to only evaluate, set evaluate to true)
-  # resume_ckpt_path: "lavis/output/BLIP2/qformer_scratch_waymo_full_ttt/20250429233/checkpoint_best.pth" 
-  evaluate: false
-  train_splits: ["train"]
-  valid_splits: ["val"]     
-  test_splits: [] #["test"]     
+  resume_ckpt_path: "lavis/output/BLIP2/qformer_scratch_waymo_full_ttt/20250429233/checkpoint_best.pth" 
+  evaluate: true
+  train_splits: [] #["train"]
+  valid_splits: [] #["val"]     
+  test_splits: ["test"]     
   device: "cuda"
   world_size: 1 # 2 number of gpu used 
   dist_url: "env://"
