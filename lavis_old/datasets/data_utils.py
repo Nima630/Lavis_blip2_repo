@@ -20,7 +20,7 @@ import torch
 from torch.utils.data.dataset import IterableDataset, ChainDataset
 # from decord import VideoReader
 # from lavis.common.registry import registry
-from lavis.datasets.base_dataset import ConcatDataset
+from lavis.datasets.datasets.base_dataset import ConcatDataset
 from tqdm import tqdm
 
 # decord.bridge.set_bridge("torch")

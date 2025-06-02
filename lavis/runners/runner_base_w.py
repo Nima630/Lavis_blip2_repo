@@ -25,10 +25,10 @@ from lavis.common.dist_utils import (
 from lavis.common.registry import registry
 from lavis.common.utils import is_url
 from lavis.datasets.data_utils import concat_datasets, reorg_datasets_by_split
-from lavis.datasets.datasets.dataloader_utils import (
+from lavis.datasets.dataloader_utils import (
     IterLoader,
     MultiIterLoader,
-    PrefetchLoader,
+    # PrefetchLoader,
     PrefetchLoader_,
 )
 from torch.nn.parallel import DistributedDataParallel as DDP

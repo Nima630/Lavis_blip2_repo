@@ -20,6 +20,7 @@ from lavis.models.blip2_models.blip2 import (
     disabled_train,
 )
 from lavis.models.blip_models.blip_outputs import BlipOutput, BlipOutputFeatures
+from lavis.models.lidar_encoders.pointnet_encoder import PointNetEncoder
 
 
 # @registry.register_model("blip2")
@@ -42,6 +43,139 @@ class Blip2Qformer(Blip2Base):
         "coco": "configs/models/blip2/blip2_coco.yaml",
         "pretrain_qformer": "configs/models/blip2/blip2_pretrain_qformer.yaml",
     }
+
+    # def __init__(
+    #     self,
+    #     vit_model="eva_clip_g",
+    #     img_size=224,
+    #     drop_path_rate=0,  # not used
+    #     use_grad_checkpoint=False,  # not used
+    #     vit_precision="fp16",  # not used
+    #     freeze_vit=True,
+    #     num_query_token=32,
+    #     cross_attention_freq=2,
+    #     embed_dim=256,
+    #     max_txt_len=32,  # not used
+    # ):
+    #     super().__init__()
+
+    #     # === RGB Encoder ===
+    #     self.visual_encoder, self.ln_vision = self.init_vision_encoder(
+    #         vit_model, img_size, drop_path_rate, use_grad_checkpoint, vit_precision
+    #     )
+    #     if freeze_vit:
+    #         for name, param in self.visual_encoder.named_parameters():
+    #             param.requires_grad = False
+    #         self.visual_encoder = self.visual_encoder.eval()
+    #         self.visual_encoder.train = disabled_train
+    #         logging.info("freeze RGB vision encoder")
+
+    #     # === LiDAR Encoder (identical structure) ===
+    #     self.lidar_encoder, self.ln_lidar = self.init_vision_encoder(
+    #         vit_model, img_size, drop_path_rate, use_grad_checkpoint, vit_precision
+    #     )
+
+    #     if freeze_vit:
+    #         for name, param in self.lidar_encoder.named_parameters():
+    #             param.requires_grad = False
+    #         self.lidar_encoder = self.lidar_encoder.eval()
+    #         self.lidar_encoder.train = disabled_train
+    #         logging.info("freeze LiDAR encoder")
+
+    #     # === Shared Q-Former for RGB and LiDAR ===
+    #     self.Qformer, self.query_tokens = self.init_Qformer(
+    #         num_query_token, self.visual_encoder.num_features, cross_attention_freq
+    #     )
+    #     # self.Qformer_lidar, self.query_tokens_lidar = self.init_Qformer(
+    #     #     num_query_token, self.lidar_encoder.num_features, cross_attention_freq
+    #     # )
+    #     qformer_lidar, query_tokens_lidar = self.init_Qformer(
+    #         num_query_token, self.lidar_encoder.num_features, cross_attention_freq)
+    #     self.Qformer_lidar = qformer_lidar
+    #     self.query_tokens_lidar = nn.Parameter(query_tokens_lidar.data.clone())
+    #     self.register_parameter("query_tokens_lidar", self.query_tokens_lidar)
+
+
+    #     # === Projection layers for contrastive loss ===
+    #     self.vision_proj = nn.Linear(self.Qformer.config.hidden_size, embed_dim)
+    #     self.lidar_proj = nn.Linear(self.Qformer_lidar.config.hidden_size, embed_dim)
+
+    #     # === Matching head (concatenated RGB + LiDAR → binary match) ===
+    #     self.matching_head = nn.Sequential(
+    #         nn.Linear(embed_dim * 2, 256),
+    #         nn.ReLU(),
+    #         nn.Linear(256, 1)
+    #     )
+
+    #     # === Learnable temperature for contrastive loss ===
+    #     self.temp = nn.Parameter(0.07 * torch.ones([]))
+
+    # def forward(self, samples):
+    #     image = samples["image"]
+    #     lidar = samples["lidar"]
+        
+    #     bs = image.size(0)
+
+    #     if dist.is_available() and dist.is_initialized():
+    #         rank = dist.get_rank()
+    #     else:
+    #         rank = 0  # or None if rank isn’t needed for your logic
+
+    #     # rank = dist.get_rank()
+
+    #     # === Encode Camera (RGB) ===
+    #     rgb_embeds = self.ln_vision(self.visual_encoder(image))
+    #     rgb_atts = torch.ones(rgb_embeds.size()[:-1], dtype=torch.long).to(image.device)
+    #     query_tokens = self.query_tokens.expand(bs, -1, -1)
+
+    #     rgb_query_output = self.Qformer.bert(
+    #         query_embeds=query_tokens,
+    #         encoder_hidden_states=rgb_embeds,
+    #         encoder_attention_mask=rgb_atts,
+    #         return_dict=True,
+    #     )
+    #     rgb_feats = F.normalize(self.vision_proj(rgb_query_output.last_hidden_state), dim=-1)
+
+    #     # === Encode LiDAR ===
+    #     lidar_embeds = self.ln_lidar(self.lidar_encoder(lidar))
+    #     lidar_atts = torch.ones(lidar_embeds.size()[:-1], dtype=torch.long).to(lidar.device)
+    #     query_tokens_lidar = self.query_tokens_lidar.expand(bs, -1, -1)
+        
+    #     lidar_query_output = self.Qformer_lidar.bert(
+    #         query_embeds=query_tokens_lidar,
+    #         encoder_hidden_states=lidar_embeds,
+    #         encoder_attention_mask=lidar_atts,
+    #         return_dict=True,
+    #     )
+    #     lidar_feats = F.normalize(self.lidar_proj(lidar_query_output.last_hidden_state), dim=-1)
+    #     rgb_feats_all = concat_all_gather(rgb_feats)
+    #     lidar_feats_all = concat_all_gather(lidar_feats)
+
+    #     B, N, D = rgb_feats_all.shape  # [B, N, D]
+
+    #     # Flatten for einsum
+    #     rgb_feats_flat = rgb_feats_all  # [B, N, D]
+    #     lidar_feats_flat = lidar_feats_all  # [B, N, D]
+
+
+    #     # Output shape: [B, B, N, N]
+    #     dot_products = torch.einsum('bnd,tmd->btmn', rgb_feats_flat, lidar_feats_flat)
+    #     # RGB→LiDAR
+    #     sim_rgb2lidar = dot_products.max(dim=-1).values.mean(dim=-1)  # shape [B, B]
+
+    #     # LiDAR→RGB
+    #     sim_lidar2rgb = dot_products.max(dim=-2).values.mean(dim=-1)  # shape [B, B]
+    #     targets = torch.arange(B).to(sim_rgb2lidar.device)  # [0, 1, ..., B-1]
+
+    #     loss_contrastive = (
+    #         F.cross_entropy(sim_rgb2lidar, targets, label_smoothing=0.1) +
+    #         F.cross_entropy(sim_lidar2rgb, targets, label_smoothing=0.1)
+    #     ) / 2
+    #     return BlipOutput(
+    #         loss=loss_contrastive,
+            
+    #     )
+
 
     def __init__(
         self,
@@ -69,47 +203,104 @@ class Blip2Qformer(Blip2Base):
             self.visual_encoder.train = disabled_train
             logging.info("freeze RGB vision encoder")
 
-        # === LiDAR Encoder (identical structure) ===
-        self.lidar_encoder, self.ln_lidar = self.init_vision_encoder(
-            vit_model, img_size, drop_path_rate, use_grad_checkpoint, vit_precision
-        )
+        # === LiDAR Encoder (PointNet instead of ViT) ===
+        self.lidar_encoder, self.ln_lidar = self.init_lidar_encoder(input_dim=5, output_dim=embed_dim)
+
+
         if freeze_vit:
             for name, param in self.lidar_encoder.named_parameters():
                 param.requires_grad = False
             self.lidar_encoder = self.lidar_encoder.eval()
             self.lidar_encoder.train = disabled_train
-            logging.info("freeze LiDAR encoder")
+            logging.info("freeze LiDAR PointNet encoder")
 
-        # === Shared Q-Former for RGB and LiDAR ===
+        # === Q-Former blocks ===
         self.Qformer, self.query_tokens = self.init_Qformer(
             num_query_token, self.visual_encoder.num_features, cross_attention_freq
         )
-        # self.Qformer_lidar, self.query_tokens_lidar = self.init_Qformer(
-        #     num_query_token, self.lidar_encoder.num_features, cross_attention_freq
-        # )
-        qformer_lidar, query_tokens_lidar = self.init_Qformer(
-            num_query_token, self.lidar_encoder.num_features, cross_attention_freq)
-        self.Qformer_lidar = qformer_lidar
+        self.Qformer_lidar, query_tokens_lidar = self.init_Qformer(
+            num_query_token, embed_dim, cross_attention_freq
+        )
         self.query_tokens_lidar = nn.Parameter(query_tokens_lidar.data.clone())
         self.register_parameter("query_tokens_lidar", self.query_tokens_lidar)
 
-
-        # === Projection layers for contrastive loss ===
+        # === Projection heads ===
         self.vision_proj = nn.Linear(self.Qformer.config.hidden_size, embed_dim)
         self.lidar_proj = nn.Linear(self.Qformer_lidar.config.hidden_size, embed_dim)
 
-        # === Matching head (concatenated RGB + LiDAR → binary match) ===
+        # === Matching head ===
         self.matching_head = nn.Sequential(
             nn.Linear(embed_dim * 2, 256),
             nn.ReLU(),
             nn.Linear(256, 1)
         )
 
-        # === Learnable temperature for contrastive loss ===
+        # === Learnable temperature ===
         self.temp = nn.Parameter(0.07 * torch.ones([]))
 
 
+        
     def forward(self, samples):
+        image = samples["image"]
+        lidar = samples["lidar"]  # [B, N, 5]
+        print(f"[DEBUG] LiDAR shape: {lidar.shape}") 
+        bs = image.size(0)
+
+        # === Encode Camera (RGB) ===
+        rgb_embeds = self.ln_vision(self.visual_encoder(image))
+        rgb_atts = torch.ones(rgb_embeds.size()[:-1], dtype=torch.long).to(image.device)
+        query_tokens = self.query_tokens.expand(bs, -1, -1)
+
+        rgb_query_output = self.Qformer.bert(
+            query_embeds=query_tokens,
+            encoder_hidden_states=rgb_embeds,
+            encoder_attention_mask=rgb_atts,
+            return_dict=True,
+        )
+        rgb_feats = F.normalize(self.vision_proj(rgb_query_output.last_hidden_state), dim=-1)
+
+        # === Encode LiDAR using frozen PointNet ===
+        lidar_feats_raw = self.lidar_encoder(lidar)         # [B, D]
+        lidar_feats_raw = lidar_feats_raw.unsqueeze(1)      # [B, 1, D]
+        lidar_embeds = self.ln_lidar(lidar_feats_raw)       # [B, 1, D]
+        lidar_atts = torch.ones(lidar_embeds.size()[:-1], dtype=torch.long).to(lidar.device)
+
+        query_tokens_lidar = self.query_tokens_lidar.expand(bs, -1, -1)
+        lidar_query_output = self.Qformer_lidar.bert(
+            query_embeds=query_tokens_lidar,
+            encoder_hidden_states=lidar_embeds,
+            encoder_attention_mask=lidar_atts,
+            return_dict=True,
+        )
+        lidar_feats = F.normalize(self.lidar_proj(lidar_query_output.last_hidden_state), dim=-1)
+
+        # === Contrastive loss ===
+        rgb_feats_all = concat_all_gather(rgb_feats)
+        lidar_feats_all = concat_all_gather(lidar_feats)
+        
+        print("rgb_feats_all", rgb_feats_all)
+        print("lidar_feats_all", lidar_feats_all)
+
+        B, N, D = rgb_feats_all.shape
+        dot_products = torch.einsum('bnd,tmd->btmn', rgb_feats_all, lidar_feats_all)
+        sim_rgb2lidar = dot_products.max(dim=-1).values.mean(dim=-1)
+        sim_lidar2rgb = dot_products.max(dim=-2).values.mean(dim=-1)
+
+        targets = torch.arange(B).to(sim_rgb2lidar.device)
+        loss_contrastive = (
+            F.cross_entropy(sim_rgb2lidar, targets, label_smoothing=0.1) +
+            F.cross_entropy(sim_lidar2rgb, targets, label_smoothing=0.1)
+        ) / 2
+
+        print("sim_rgb2lidar", sim_rgb2lidar)
+
+        print("sim_lidar2rgb", sim_lidar2rgb)
+
+        print("loss_contrastive", loss_contrastive)
+        return BlipOutput(loss=loss_contrastive)
+
+
+    def forward_(self, samples):
         # print("Samples keys:", samples.keys())
         image = samples["image"]
         lidar = samples["lidar"]
@@ -283,73 +474,6 @@ class Blip2Qformer(Blip2Base):
         return BlipOutput(
             loss=loss_contrastive,
             # loss_itc=loss_contrastive,
-        )
-
-
-    def forward_(self, samples):
-        image = samples["image"]
-        lidar = samples["lidar"]
-        
-        bs = image.size(0)
-
-        if dist.is_available() and dist.is_initialized():
-            rank = dist.get_rank()
-        else:
-            rank = 0  # or None if rank isn’t needed for your logic
-
-        # rank = dist.get_rank()
-
-        # === Encode Camera (RGB) ===
-        rgb_embeds = self.ln_vision(self.visual_encoder(image))
-        rgb_atts = torch.ones(rgb_embeds.size()[:-1], dtype=torch.long).to(image.device)
-        query_tokens = self.query_tokens.expand(bs, -1, -1)
-
-        rgb_query_output = self.Qformer.bert(
-            query_embeds=query_tokens,
-            encoder_hidden_states=rgb_embeds,
-            encoder_attention_mask=rgb_atts,
-            return_dict=True,
-        )
-        rgb_feats = F.normalize(self.vision_proj(rgb_query_output.last_hidden_state), dim=-1)
-
-        # === Encode LiDAR ===
-        lidar_embeds = self.ln_lidar(self.lidar_encoder(lidar))
-        lidar_atts = torch.ones(lidar_embeds.size()[:-1], dtype=torch.long).to(lidar.device)
-        query_tokens_lidar = self.query_tokens_lidar.expand(bs, -1, -1)
-        
-        lidar_query_output = self.Qformer_lidar.bert(
-            query_embeds=query_tokens_lidar,
-            encoder_hidden_states=lidar_embeds,
-            encoder_attention_mask=lidar_atts,
-            return_dict=True,
-        )
-        lidar_feats = F.normalize(self.lidar_proj(lidar_query_output.last_hidden_state), dim=-1)
-        rgb_feats_all = concat_all_gather(rgb_feats)
-        lidar_feats_all = concat_all_gather(lidar_feats)
-
-        B, N, D = rgb_feats_all.shape  # [B, N, D]
-
-        # Flatten for einsum
-        rgb_feats_flat = rgb_feats_all  # [B, N, D]
-        lidar_feats_flat = lidar_feats_all  # [B, N, D]
-
-
-        # Output shape: [B, B, N, N]
-        dot_products = torch.einsum('bnd,tmd->btmn', rgb_feats_flat, lidar_feats_flat)
-        # RGB→LiDAR
-        sim_rgb2lidar = dot_products.max(dim=-1).values.mean(dim=-1)  # shape [B, B]
-
-        # LiDAR→RGB
-        sim_lidar2rgb = dot_products.max(dim=-2).values.mean(dim=-1)  # shape [B, B]
-        targets = torch.arange(B).to(sim_rgb2lidar.device)  # [0, 1, ..., B-1]
-
-        loss_contrastive = (
-            F.cross_entropy(sim_rgb2lidar, targets, label_smoothing=0.1) +
-            F.cross_entropy(sim_lidar2rgb, targets, label_smoothing=0.1)
-        ) / 2
-        return BlipOutput(
-            loss=loss_contrastive,
-            
         )
 
 

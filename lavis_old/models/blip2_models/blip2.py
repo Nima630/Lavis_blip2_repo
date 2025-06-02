@@ -20,11 +20,11 @@ from lavis.common.dist_utils import download_cached_file
 from lavis.common.utils import is_url
 from lavis.common.logger import MetricLogger
 from lavis.models.base_model import BaseModel
-from lavis.models.blip2_models.Qformer import BertConfig, BertLMHeadModel
+from Lavis_blip2.lavis.models.Qformer import BertConfig, BertLMHeadModel
 from lavis.models.eva_vit import create_eva_vit_g
 from lavis.models.clip_vit import create_clip_vit_L
 from transformers import BertTokenizer
-
+# from lavis.models.lidar_encoders.pointnet_encoder import PointNetEncoder
 
 class Blip2Base(BaseModel):
     @classmethod
@@ -62,6 +62,10 @@ class Blip2Base(BaseModel):
         query_tokens.data.normal_(mean=0.0, std=encoder_config.initializer_range)
         return Qformer, query_tokens
 
+
+
+
+
     def init_vision_encoder( # --------------------------------------------------------------
         self, model_name, img_size, drop_path_rate, use_grad_checkpoint, precision
     ):
@@ -86,107 +90,12 @@ class Blip2Base(BaseModel):
         self.vit_name = model_name
         return visual_encoder, ln_vision
 
-    # def load_from_pretrained(self, url_or_filename):
-    #     if is_url(url_or_filename):
-    #         cached_file = download_cached_file(
-    #             url_or_filename, check_hash=False, progress=True
-    #         )
-    #         checkpoint = torch.load(cached_file, map_location="cpu")
-    #     elif os.path.isfile(url_or_filename):
-    #         checkpoint = torch.load(url_or_filename, map_location="cpu")
-    #     else:
-    #         raise RuntimeError("checkpoint url or path is invalid")
+    # def init_lidar_encoder(self, input_dim=5, output_dim=1408):
+        
 
-    #     state_dict = checkpoint["model"]
-
-    #     msg = self.load_state_dict(state_dict, strict=False)
-
-    #     # logging.info("Missing keys {}".format(msg.missing_keys))
-    #     logging.info("load checkpoint from %s" % url_or_filename)
-
-    #     return msg
-
-    # def get_optimizer_params(self, weight_decay, lr_scale=1):
-
-    #     vit_num_layers = self.visual_encoder.get_num_layer()
-    #     lr_scales = list(lr_scale ** (vit_num_layers + 1 - i) for i in range(vit_num_layers + 2))
-
-    #     parameter_group_names = {}
-    #     parameter_group_vars = {}
-
-    #     for name, param in self.named_parameters():
-    #         if not param.requires_grad:
-    #             continue  # frozen weights
-    #         if len(param.shape) == 1 or name.endswith(".bias"):
-    #             group_name = "no_decay"
-    #             this_weight_decay = 0.
-    #         else:
-    #             group_name = "decay"
-    #             this_weight_decay = weight_decay
-    #         if 'visual_encoder' in name:
-    #             layer_id = self.visual_encoder.get_num_layer(name.replace('visual_encoder.',''))
-    #             group_name = "vit_layer_%d_%s" % (layer_id, group_name)
-    #         else:
-    #             layer_id = None
-
-    #         if group_name not in parameter_group_names:
-    #             if layer_id is not None:
-    #                 scale = lr_scales[layer_id]
-    #             else:
-    #                 scale = 1
-    #             parameter_group_names[group_name] = {
-    #                 "weight_decay": this_weight_decay,
-    #                 "params": [],
-    #                 "lr_scale": scale
-    #             }
-    #             parameter_group_vars[group_name] = {
-    #                 "weight_decay": this_weight_decay,
-    #                 "params": [],
-    #                 "lr_scale": scale
-    #             }
-    #         parameter_group_vars[group_name]["params"].append(param)
-    #         parameter_group_names[group_name]["params"].append(name)
-    #     # import json
-    #     # print("Param groups = %s" % json.dumps(parameter_group_names, indent=2))
-    #     optim_params = list(parameter_group_vars.values())
-    #     return optim_params
-
-    # def _lemmatize(self, answers):
-    #     def apply(answer):
-    #         doc = self.lemmatizer(answer)
-
-    #         words = []
-    #         for token in doc:
-    #             if token.pos_ in ["NOUN", "VERB"]:
-    #                 words.append(token.lemma_)
-    #             else:
-    #                 words.append(token.text)
-    #         answer = " ".join(words)
-
-    #         return answer
-
-    #     return [apply(answer) for answer in answers]
-
-    # @property
-    # def lemmatizer(self):
-    #     if self._lemmatizer is None:
-    #         try:
-    #             import spacy
-
-    #             self._lemmatizer = spacy.load("en_core_web_sm")
-    #         except ImportError:
-    #             logging.error(
-    #                 """
-    #                 Please install spacy and en_core_web_sm model to apply lemmatization.
-    #                 python -m spacy download en_core_web_sm
-    #                 OR
-    #                 import spacy.cli
-    #                 spacy.cli.download("en_core_web_sm")
-    #                 """
-    #             )
-    #             exit(1)
-
-    #     return self._lemmatizer
+    #     lidar_encoder = PointNetEncoder(input_dim=input_dim, output_dim=output_dim)
+    #     ln_lidar = LayerNorm(output_dim)
+    #     return lidar_encoder, ln_lidar
 
 def disabled_train(self, mode=True): # --------------------------------------------------------------
     """Overwrite model.train with this function to make sure train/eval mode
