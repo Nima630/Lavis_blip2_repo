@@ -11,9 +11,9 @@ import time
 from collections import defaultdict, deque
 
 import torch
-import torch.distributed as dist
+# import torch.distributed as dist
 
-from lavis.common import dist_utils
+# from lavis.common import dist_utils
 
 
 class SmoothedValue(object):
@@ -34,18 +34,22 @@ class SmoothedValue(object):
         self.count += n
         self.total += value * n
 
+    # def synchronize_between_processes(self):
+    #     """
+    #     Warning: does not synchronize the deque!
+    #     """
+    #     if not dist_utils.is_dist_avail_and_initialized():
+    #         return
+    #     t = torch.tensor([self.count, self.total], dtype=torch.float64, device="cuda")
+    #     dist.barrier()
+    #     dist.all_reduce(t)
+    #     t = t.tolist()
+    #     self.count = int(t[0])
+    #     self.total = t[1]
+
     def synchronize_between_processes(self):
-        """
-        Warning: does not synchronize the deque!
-        """
-        if not dist_utils.is_dist_avail_and_initialized():
-            return
-        t = torch.tensor([self.count, self.total], dtype=torch.float64, device="cuda")
-        dist.barrier()
-        dist.all_reduce(t)
-        t = t.tolist()
-        self.count = int(t[0])
-        self.total = t[1]
+        # No-op since we're not using distributed training
+        return
 
     @property
     def median(self):
@@ -189,7 +193,8 @@ class AttrDict(dict):
 
 def setup_logger(): # ----------------------------------------------------------------------------------------------------------
     logging.basicConfig(
-        level=logging.INFO if dist_utils.is_main_process() else logging.WARN,
+        # level=logging.INFO if dist_utils.is_main_process() else logging.WARN,
+        level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=[logging.StreamHandler()],
     )

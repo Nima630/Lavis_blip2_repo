@@ -1,8 +1,5 @@
 """
- Copyright (c) 2022, salesforce.com, inc.
- All rights reserved.
- SPDX-License-Identifier: BSD-3-Clause
- For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
+Simplified RunnerBaseW for non-distributed 2-GPU training using DataParallel
 """
 
 import datetime
@@ -11,49 +8,31 @@ import logging
 import os
 import time
 from pathlib import Path
-
+from lavis.common.logger import MetricLogger, SmoothedValue
 import torch
-import torch.distributed as dist
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from torch.utils.data.dataset import ChainDataset
+from lavis.datasets.data_utils import prepare_sample
 import webdataset as wds
+from torch import autocast
 from lavis.common.dist_utils import (
     download_cached_file,
-    get_rank,
-    get_world_size,
     is_main_process,
     main_process,
 )
 from lavis.common.registry import registry
 from lavis.common.utils import is_url
-from lavis.datasets.data_utils import concat_datasets, reorg_datasets_by_split
-from lavis.datasets.dataloader_utils import (
-    IterLoader,
-    MultiIterLoader,
-    # PrefetchLoader,
-    PrefetchLoader_,
-)
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, DistributedSampler
-from torch.utils.data.dataset import ChainDataset
+from lavis.datasets.data_utils import concat_datasets
+from lavis.datasets.dataloader_utils import IterLoader, MultiIterLoader, PrefetchLoader_
 
 
-# @registry.register_runner("runner_base")
 class RunnerBaseW:
-    """
-    A runner class to train and evaluate a model given a task and datasets.
-
-    The runner uses pytorch distributed data parallel by default. Future release
-    will support other distributed frameworks.
-    """
-
     def __init__(self, cfg, task, model, datasets, job_id):
-        # print("[TRACE] runner_base.py")
         self.config = cfg
-        self.job_id = job_id
-
-        self.task = task
         self.datasets = datasets
-
         self._model = model
+        self.job_id = job_id
 
         self._wrapped_model = None
         self._device = None
@@ -63,593 +42,106 @@ class RunnerBaseW:
         self._lr_sched = None
 
         self.start_epoch = 0
-
-        # self.setup_seeds()
         self.setup_output_dir()
 
     @property
     def device(self):
         if self._device is None:
             self._device = torch.device(self.config.run_cfg.device)
-
         return self._device
 
     @property
-    def use_distributed(self):
-        return self.config.run_cfg.distributed
-
-    @property
     def model(self):
-        """
-        A property to get the DDP-wrapped model on the device.
-        """
-        # move model to device
         if self._model.device != self.device:
             self._model = self._model.to(self.device)
-
-            # distributed training wrapper
-            if self.use_distributed:
-                if self._wrapped_model is None:
-                    self._wrapped_model = DDP(
-                        self._model, device_ids=[self.config.run_cfg.gpu], find_unused_parameters=True
-                    )
-                    
-                    # local_rank = int(os.environ.get("LOCAL_RANK", 0))
-                    # print("[DEBUG] Model object:", self._model)
-                    # print("[DEBUG] device_ids =", [local_rank])
-            else:
-                self._wrapped_model = self._model
-
+            if self._wrapped_model is None:
+                self._wrapped_model = nn.DataParallel(self._model).cuda()
         return self._wrapped_model
 
     @property
     def optimizer(self):
-        # TODO make optimizer class and configurations
         if self._optimizer is None:
             lr_scale = self.config.run_cfg.get("lr_layer_decay", 1)
             weight_decay = self.config.run_cfg.get("weight_decay", 0.05)
-            optim_params = self._model.get_optimizer_params(weight_decay,lr_scale)
+            optim_params = self._model.get_optimizer_params(weight_decay, lr_scale)
 
-            num_parameters = 0
-            for p_group in optim_params:
-                for p in p_group["params"]:
-                    num_parameters += p.data.nelement()    
-            logging.info("number of trainable parameters: {}".format(num_parameters))      
-                  
             beta2 = self.config.run_cfg.get("beta2", 0.999)
-
             self._optimizer = torch.optim.AdamW(
                 optim_params,
                 lr=float(self.config.run_cfg.init_lr),
                 betas=(0.9, beta2),
-            )    
+            )
         return self._optimizer
 
     @property
     def scaler(self):
-        amp = self.config.run_cfg.get("amp", False)
-
-        if amp:
+        if self.config.run_cfg.get("amp", False):
             if self._scaler is None:
                 self._scaler = torch.cuda.amp.GradScaler()
-
         return self._scaler
 
     @property
     def lr_scheduler(self):
-        """
-        A property to get and create learning rate scheduler by split just in need.
-        """
         if self._lr_sched is None:
             lr_sched_cls = registry.get_lr_scheduler_class(self.config.run_cfg.lr_sched)
-
-            # max_epoch = self.config.run_cfg.max_epoch
-            max_epoch = self.max_epoch
-            # min_lr = self.config.run_cfg.min_lr
-            min_lr = self.min_lr
-            # init_lr = self.config.run_cfg.init_lr
-            init_lr = self.init_lr
-
-            # optional parameters
-            decay_rate = self.config.run_cfg.get("lr_decay_rate", None)
-            warmup_start_lr = self.config.run_cfg.get("warmup_lr", -1)
-            warmup_steps = self.config.run_cfg.get("warmup_steps", 0)
-
             self._lr_sched = lr_sched_cls(
                 optimizer=self.optimizer,
-                max_epoch=max_epoch,
-                min_lr=min_lr,
-                init_lr=init_lr,
-                decay_rate=decay_rate,
-                warmup_start_lr=warmup_start_lr,
-                warmup_steps=warmup_steps,
+                max_epoch=self.max_epoch,
+                min_lr=self.min_lr,
+                init_lr=self.init_lr,
+                decay_rate=self.config.run_cfg.get("lr_decay_rate", None),
+                warmup_start_lr=self.config.run_cfg.get("warmup_lr", -1),
+                warmup_steps=self.config.run_cfg.get("warmup_steps", 0),
             )
-
         return self._lr_sched
 
-    @property # ---------------------------------------------------------------------------------
-    def dataloaders(self) -> dict:
-        """
-        A property to get and create dataloaders by split just in need.
-
-        If no train_dataset_ratio is provided, concatenate map-style datasets and
-        chain wds.DataPipe datasets separately. Training set becomes a tuple
-        (ConcatDataset, ChainDataset), both are optional but at least one of them is
-        required. The resultant ConcatDataset and ChainDataset will be sampled evenly.
-
-        If train_dataset_ratio is provided, create a MultiIterLoader to sample
-        each dataset by ratios during training.
-
-        Currently do not support multiple datasets for validation and test.
-
-        Returns:
-            dict: {split_name: (tuples of) dataloader}
-        """
+    @property
+    def dataloaders(self):
         if self._dataloaders is None:
-            # reoganize datasets by split and concatenate/chain if necessary
-            dataset_ratios = self.config.run_cfg.get("train_dataset_ratios", None)
-
-            # concatenate map-style datasets and chain wds.DataPipe datasets separately
-            # training set becomes a tuple (ConcatDataset, ChainDataset), both are
-            # optional but at least one of them is required. The resultant ConcatDataset
-            # and ChainDataset will be sampled evenly.
-            logging.info(
-                "dataset_ratios not specified, datasets will be concatenated (map-style datasets) or chained (webdataset.DataPipeline)."
-            )
-
-            # datasets = reorg_datasets_by_split(self.datasets)
-            # self.datasets = concat_datasets(datasets)
-            datasets = self.datasets
-            # print("[DEBUG] Datasets being passed into create_loaders:", datasets)
-            # print dataset statistics after concatenation/chaining
-            for split_name in self.datasets:
-                if isinstance(self.datasets[split_name], tuple) or isinstance(
-                    self.datasets[split_name], list
-                ):
-                    # mixed wds.DataPipeline and torch.utils.data.Dataset
-                    num_records = sum(
-                        [
-                            len(d)
-                            if not type(d) in [wds.DataPipeline, ChainDataset]
-                            else 0
-                            for d in self.datasets[split_name]
-                        ]
-                    )
-
-                else:
-                    if hasattr(self.datasets[split_name], "__len__"):
-                        # a single map-style dataset
-                        num_records = len(self.datasets[split_name])
-                    else:
-                        # a single wds.DataPipeline
-                        num_records = -1
-                        logging.info(
-                            "Only a single wds.DataPipeline dataset, no __len__ attribute."
-                        )
-
-                if num_records >= 0:
-                    logging.info(
-                        "Loaded {} records for {} split from the dataset.".format(
-                            num_records, split_name
-                        )
-                    )
-
-            # create dataloaders
-            split_names = sorted(self.datasets.keys())
-
-            # datasets = [self.datasets[split] for split in split_names]
-            datasets = [datasets[split] for split in split_names]
-
-            is_trains = [split in self.train_splits for split in split_names]
-
+            datasets = [self.datasets[split] for split in sorted(self.datasets)]
+            is_trains = [split in self.train_splits for split in sorted(self.datasets)]
             batch_sizes = [
-                self.config.run_cfg.batch_size_train
-                if split == "train"
-                else self.config.run_cfg.batch_size_eval
-                for split in split_names
+                self.config.run_cfg.batch_size_train if is_train else self.config.run_cfg.batch_size_eval
+                for is_train in is_trains
+            ]
+            collate_fns = [
+                [getattr(d, "collater", None) for d in dataset] if isinstance(dataset, (list, tuple))
+                else getattr(dataset, "collater", None)
+                for dataset in datasets
             ]
 
-            collate_fns = []
-            for dataset in datasets:
-                if isinstance(dataset, (tuple, list)):
-                    # print(f"[DEBUG] Dataset is a tuple/list with {len(dataset)} items")
-                    # for d in dataset:
-                    #     print(f"    - Sub-dataset type: {type(d)}, length: {len(d) if hasattr(d, '__len__') else 'unknown'}")
-                    collate_fns.append([getattr(d, "collater", None) for d in dataset])
-                else:
-                    # print(f"[DEBUG] Dataset type: {type(dataset)}, length: {len(dataset) if hasattr(dataset, '__len__') else 'unknown'}")
-                    collate_fns.append(getattr(dataset, "collater", None))
-
-
-            # collate_fns = []
-            # for dataset in datasets:
-            #     if isinstance(dataset, tuple) or isinstance(dataset, list):
-            #         collate_fns.append([getattr(d, "collater", None) for d in dataset])
-            #     else:
-            #         collate_fns.append(getattr(dataset, "collater", None))
-
             dataloaders = self.create_loaders(
-                datasets=datasets,
-                num_workers=self.config.run_cfg.num_workers,
-                batch_sizes=batch_sizes,
-                is_trains=is_trains,
-                collate_fns=collate_fns,
-                dataset_ratios=dataset_ratios,
+                datasets,
+                self.config.run_cfg.num_workers,
+                batch_sizes,
+                is_trains,
+                collate_fns,
             )
-
-            self._dataloaders = {k: v for k, v in zip(split_names, dataloaders)}
-            # print("[DEBUG] Created dataloaders:", self._dataloaders.keys())
-            # print("[DEBUG] Created dataloaders:")
-
-            for split_name, loader in self._dataloaders.items():
-                # print(f"  • Split: '{split_name}'")
-                # print(f"    - Loader type: {type(loader)}")
-
-                # If loader is IterLoader, try to access the underlying dataloader
-                inner_loader = getattr(loader, 'loader', None)
-
-                if inner_loader is not None:
-                    # print(f"    - Underlying dataset type: {type(inner_loader.dataset)}")
-                    try:
-                        dataset_length = len(inner_loader.dataset)
-                        # print(f"    - Dataset length: {dataset_length}")
-                        if dataset_length == 0:
-                            raise RuntimeError(f"Error: Dataset for split '{split_name}' is empty! Please check your data paths or preprocessing.")
-                    # except:
-                    #     print(f"    - Dataset length: unknown")
-                    except Exception as e:
-                        print(f"    - Dataset length: unknown ({e})")
-                    # Optional: peek one sample batch (be cautious if dataset is huge)
-                    try:
-                        sample_batch = next(iter(inner_loader))
-                        sample_keys = sample_batch.keys() if isinstance(sample_batch, dict) else type(sample_batch)
-                        # print(f"    - Sample batch keys: {sample_keys}")
-                    except Exception as e:
-                        print(f"    - Could not preview batch: {e}")
-                else:
-                    print("    - Could not access inner loader or dataset.")
-
-
-
+            self._dataloaders = {k: v for k, v in zip(sorted(self.datasets), dataloaders)}
         return self._dataloaders
 
-    @property
-    def cuda_enabled(self):
-        return self.device.type == "cuda"
-
-    @property
-    def max_epoch(self):
-        return int(self.config.run_cfg.max_epoch)
-
-    @property
-    def log_freq(self):
-        log_freq = self.config.run_cfg.get("log_freq", 50)
-        return int(log_freq)
-    
-    @property
-    def save_freq(self):
-        save_freq = self.config.run_cfg.get("save_freq", 5)
-        return int(save_freq)
-
-    @property
-    def val_freq(self):
-        val_freq = self.config.run_cfg.get("val_freq", 1)
-        return int(val_freq)
-    
-    @property
-    def save_last(self):
-        save_last = self.config.run_cfg.get("save_last", True)
-        return int(save_last)
-
-    @property
-    def init_lr(self):
-        return float(self.config.run_cfg.init_lr)
-
-    @property
-    def min_lr(self):
-        return float(self.config.run_cfg.min_lr)
-
-    @property
-    def accum_grad_iters(self):
-        return int(self.config.run_cfg.get("accum_grad_iters", 1))
-
-    @property
-    def valid_splits(self):
-        valid_splits = self.config.run_cfg.get("valid_splits", [])
-
-        if len(valid_splits) == 0:
-            logging.info("No validation splits found.")
-
-        return valid_splits
-
-    @property
-    def test_splits(self):
-        test_splits = self.config.run_cfg.get("test_splits", [])
-
-        return test_splits
-
-    @property
-    def train_splits(self):
-        train_splits = self.config.run_cfg.get("train_splits", [])
-
-        if len(train_splits) == 0:
-            logging.info("Empty train splits.")
-
-        return train_splits
-
-    @property
-    def evaluate_only(self): # ---------------------------------------------------------------------------------
-        """
-        Set to True to skip training.
-        """
-        return self.config.run_cfg.evaluate
-
-    @property
-    def use_dist_eval_sampler(self):
-        return self.config.run_cfg.get("use_dist_eval_sampler", True)
-
-    @property
-    def resume_ckpt_path(self): # ---------------------------------------------------------------------------------
-        return self.config.run_cfg.get("resume_ckpt_path", None)
-
-    @property
-    def train_loader(self): # ---------------------------------------------------------------------------------
-        train_dataloader = self.dataloaders["train"]
-        # print(">>> [DEBUG] self.dataloaders['train']:", self.dataloaders["train"])
-        return train_dataloader
-
-    def setup_output_dir(self): #----------------------------------------------------------------------------------
-        lib_root = Path(registry.get_path("library_root"))
-
-        output_dir = lib_root / self.config.run_cfg.output_dir / self.job_id
-        result_dir = output_dir / "result"
-
-        output_dir.mkdir(parents=True, exist_ok=True)
-        result_dir.mkdir(parents=True, exist_ok=True)
-
-        registry.register_path("result_dir", str(result_dir))
-        registry.register_path("output_dir", str(output_dir))
-
-        self.result_dir = result_dir
-        self.output_dir = output_dir
-    
-    # performs train, val, test
-    def train(self):
-        start_time = time.time()
-        # best_agg_metric = 0
-        best_val_loss_so_far = float("inf")
-        best_epoch = 0
-
-        self.log_config()
-
-        # resume from checkpoint if specified
-        # if not self.evaluate_only and self.resume_ckpt_path is not None:
-        if self.resume_ckpt_path is not None:
-            print("loding model ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
-            self._load_checkpoint(self.resume_ckpt_path)
-
-        for cur_epoch in range(self.start_epoch, self.max_epoch):
-            # training phase
-            if not self.evaluate_only:
-                logging.info("Start training")
-                train_stats = self.train_epoch(cur_epoch)
-                self.log_stats(split_name="train", stats=train_stats)
-
-            # evaluation phase
-            if len(self.valid_splits) > 0 and (self.evaluate_only or cur_epoch%self.val_freq == 0):
-                for split_name in self.valid_splits:
-                    logging.info("Evaluating on {}.".format(split_name))
-                    
-                    val_log = self.eval_epoch(
-                        split_name=split_name, cur_epoch=cur_epoch)
-
-
-                    if val_log is not None:
-                        if is_main_process():
-                            current_val_loss = val_log["loss"]
-                            if current_val_loss < best_val_loss_so_far and split_name == "val":
-                                best_epoch, best_val_loss_so_far = cur_epoch, current_val_loss
-                                if not self.evaluate_only:
-                                    self._save_checkpoint(cur_epoch, is_best=True) 
-                        
-                            val_log.update({"best_epoch": best_epoch})
-                            self.log_stats(val_log, split_name)
-
-            if self.evaluate_only:
-                break
-
-            # commented because no no enough memory for saving models
-            #   
-            # # If no validation or regardless of it, save based on save frequency
-            # if not self.evaluate_only and self.save_freq > 0 and cur_epoch % self.save_freq == 0:
-            #     self._save_checkpoint(cur_epoch, is_best=False)
-
-            
-            if dist.is_available() and dist.is_initialized():
-                dist.barrier()
-        # if no validation, save the last model
-        best_checkpoint_path = os.path.join(self.output_dir, "checkpoint_best.pth")
-        if not os.path.exists(best_checkpoint_path):
-            logging.info("No best checkpoint found. Saving last model as best.")
-            self._save_checkpoint(cur_epoch, is_best=True)
-
-        # testing phase
-        # test_epoch = "best" if len(self.valid_splits) > 0 else cur_epoch
-        # test_logs = self.evaluate(cur_epoch=test_epoch, skip_reload=self.evaluate_only)
-        # if is_main_process():
-        #     for split_name, split_log in test_logs.items():
-        #         self.log_stats(split_log, split_name)
-        # print(test_logs["test"])
-        # total_time = time.time() - start_time
-        # total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-        # logging.info("Training time {}".format(total_time_str))
-
-                    
-    # testing phase
-    def evaluate(self, cur_epoch="best", skip_reload=False): # --------------------------------------------------------------------------------- 
-        test_logs = dict()
-
-        if len(self.test_splits) > 0:
-            for split_name in self.test_splits:
-                test_logs[split_name] = self.eval_epoch(
-                    split_name=split_name, cur_epoch=cur_epoch, skip_reload=skip_reload
-                )
-
-            return test_logs
-
-    def train_epoch(self, epoch):
-        # train
-        # print(">>> [DEBUG] Train loader object:", self.train_loader)
-
-        self.model.train()
-
-        return self.task.train_epoch(
-            epoch=epoch,
-            model=self.model,
-            data_loader=self.train_loader,
-            optimizer=self.optimizer,
-            scaler=self.scaler,
-            lr_scheduler=self.lr_scheduler,
-            cuda_enabled=self.cuda_enabled,
-            log_freq=self.log_freq,
-            accum_grad_iters=self.accum_grad_iters,
-        )
-
-    @torch.no_grad()
-    def eval_epoch(self, split_name, cur_epoch, skip_reload=False): # ---------------------------------------------------------------------------------
-        """
-        Evaluate the model on a given split.
-
-        Args:
-            split_name (str): name of the split to evaluate on.
-            cur_epoch (int): current epoch.
-            skip_reload_best (bool): whether to skip reloading the best checkpoint.
-                During training, we will reload the best checkpoint for validation.
-                During testing, we will use provided weights and skip reloading the best checkpoint .
-        """
-        data_loader = self.dataloaders.get(split_name, None)
-        assert data_loader, "data_loader for split {} is None.".format(split_name)
-
-        # TODO In validation, you need to compute loss as well as metrics
-        # TODO consider moving to model.before_evaluation()
-        model = self.unwrap_dist_model(self.model)
-        if not skip_reload and cur_epoch == "best":
-            model = self._reload_best_model(model)
-        model.eval()
-
-        self.task.before_evaluation( # DistributedDataParallel setup wrapper
-            model=model,
-            dataset=self.datasets[split_name],
-        )
-        results = self.task.evaluation(self.config, model, data_loader)
-
-        if results is not None:
-            output = self.task.after_evaluation(self.config, 
-                val_result=results,
-                split_name=split_name,
-                epoch=cur_epoch,
-            )
-            return output
-        else:
-            return None
-
-    def unwrap_dist_model(self, model):
-        if self.use_distributed:
-            return model.module
-        else:
-            return model
-
-
-    def create_loaders(
-        self,
-        datasets,
-        num_workers,
-        batch_sizes,
-        is_trains,
-        collate_fns,
-        dataset_ratios=None,
-    ):
-        """
-        Create dataloaders for training and validation.
-        """
-
+    def create_loaders(self, datasets, num_workers, batch_sizes, is_trains, collate_fns, dataset_ratios=None):
         def _create_loader(dataset, num_workers, bsz, is_train, collate_fn):
-            # print("\n[LOADER DEBUG] Starting _create_loader")
-            # print(f"  • Dataset object: {dataset}")
-            # print(f"  • Dataset type: {type(dataset)}")
-            try:
-                print(f"  • Dataset length: {len(dataset)}")
-            except Exception as e:
-                print(f"  • Dataset length: unknown ({e})")
-
-            # print(f"  • Batch size: {bsz}")
-            # print(f"  • Is training: {is_train}")
-            # print(f"  • Collate function: {collate_fn}")
-
             if isinstance(dataset, ChainDataset) or isinstance(dataset, wds.DataPipeline):
-                # print("[LOADER DEBUG] Detected streaming-style dataset (ChainDataset or wds.DataPipeline)")
-                loader = iter(
-                    DataLoader(
-                        dataset,
-                        batch_size=bsz,
-                        num_workers=num_workers,
-                        pin_memory=True,
-                    )
-                )
-                # print("[LOADER DEBUG] Created iterable DataLoader for streaming-style dataset")
+                loader = iter(DataLoader(dataset, batch_size=bsz, num_workers=num_workers, pin_memory=True))
             else:
-                if self.use_distributed:
-                    sampler = DistributedSampler(
-                        dataset,
-                        shuffle=is_train,
-                        num_replicas=get_world_size(),
-                        rank=get_rank(),
-                    )
-                    if not self.use_dist_eval_sampler:
-                        sampler = sampler if is_train else None
-                else:
-                    sampler = None
-
-                # print("[LOADER DEBUG] Creating torch.utils.data.DataLoader with:")
-                # print(f"    - batch_size = {bsz}")
-                # print(f"    - num_workers = {num_workers}")
-                # print(f"    - pin_memory = True")
-                # print(f"    - sampler = {sampler}")
-                # print(f"    - shuffle = {sampler is None and is_train}")
-                # print(f"    - drop_last = {is_train}")
-                # print(f"    - collate_fn = {collate_fn}")
-
                 loader = DataLoader(
                     dataset,
                     batch_size=bsz,
                     num_workers=num_workers,
                     pin_memory=True,
-                    sampler=sampler,
-                    shuffle=sampler is None and is_train,
+                    shuffle=is_train,
                     collate_fn=collate_fn,
-                    drop_last=True if is_train else False,
+                    drop_last=is_train,
                 )
-                # print(f"[LOADER DEBUG] DataLoader created: {loader}")
                 loader = PrefetchLoader_(loader)
-                # print(f"[LOADER DEBUG] Wrapped in PrefetchLoader: {type(loader)}")
-
                 if is_train:
-                    loader = IterLoader(loader, use_distributed=self.use_distributed)
-                    # print(f"[LOADER DEBUG] Wrapped in IterLoader: {type(loader)}")
-
-            # print("[LOADER DEBUG] Finished creating loader\n")
+                    loader = IterLoader(loader, use_distributed=False)
             return loader
 
         loaders = []
-
         for dataset, bsz, is_train, collate_fn in zip(datasets, batch_sizes, is_trains, collate_fns):
-            # print("\n[DEBUG] Creating loader...")
-            # print(f"  • Raw dataset input: {dataset}")
-            # print(f"  • Dataset type: {type(dataset)}")
-            # print(f"  • Is training split: {is_train}")
-
-            if isinstance(dataset, list) or isinstance(dataset, tuple):
-                # print(f"[DEBUG] Creating MultiIterLoader from {len(dataset)} sub-datasets...")
+            if isinstance(dataset, (list, tuple)):
                 loader = MultiIterLoader(
                     loaders=[
                         _create_loader(d, num_workers, bsz, is_train, collate_fn[i])
@@ -657,34 +149,95 @@ class RunnerBaseW:
                     ],
                     ratios=dataset_ratios,
                 )
-                # print(f"[DEBUG] Created MultiIterLoader: {loader}")
             else:
                 loader = _create_loader(dataset, num_workers, bsz, is_train, collate_fn)
-                # print(f"[DEBUG] Created single loader: {loader}")
-
-            # print(f"[DEBUG] Final loader instance: {type(loader)}\n")
             loaders.append(loader)
-
-        # print("[DEBUG] Returning all loaders")
         return loaders
 
+    @property
+    def train_loader(self):
+        return self.dataloaders["train"]
 
+    def train(self):
+        best_val_loss_so_far = float("inf")
+        best_epoch = 0
+        self.log_config()
+
+        if self.resume_ckpt_path is not None:
+            self._load_checkpoint(self.resume_ckpt_path)
+
+        for cur_epoch in range(self.start_epoch, self.max_epoch):
+            if not self.evaluate_only:
+                train_stats = self.train_epoch(cur_epoch)
+                self.log_stats(train_stats, "train")
+
+            if len(self.valid_splits) > 0 and (self.evaluate_only or cur_epoch % self.val_freq == 0):
+                for split_name in self.valid_splits:
+                    val_log = self.eval_epoch(split_name, cur_epoch)
+                    if val_log and is_main_process():
+                        current_val_loss = val_log["loss"]
+                        if current_val_loss < best_val_loss_so_far and split_name == "val":
+                            best_epoch, best_val_loss_so_far = cur_epoch, current_val_loss
+                            if not self.evaluate_only:
+                                self._save_checkpoint(cur_epoch, is_best=True)
+                        val_log.update({"best_epoch": best_epoch})
+                        self.log_stats(val_log, split_name)
+
+            if self.evaluate_only:
+                break
+
+        if not os.path.exists(os.path.join(self.output_dir, "checkpoint_best.pth")):
+            self._save_checkpoint(cur_epoch, is_best=True)
+
+
+    def train_epoch(self, epoch):
+        self.model.train()
+
+        stats = self._train_inner_loop(
+            epoch=epoch,
+            iters_per_epoch=len(self.train_loader),
+            model=self.model,
+            data_loader=self.train_loader,
+            optimizer=self.optimizer,
+            scaler=self.scaler,
+            lr_scheduler=self.lr_scheduler,
+            log_freq=self.log_freq,
+            cuda_enabled=self.cuda_enabled,
+            accum_grad_iters=self.accum_grad_iters,
+        )
+
+        stats = {f"{k}": v for k, v in stats.items()}
+        stats["epoch"] = epoch
+        return stats
+
+
+
+
+    @torch.no_grad()
+    def eval_epoch(self, split_name, cur_epoch, skip_reload=False):
+        data_loader = self.dataloaders.get(split_name, None)
+        assert data_loader, f"DataLoader for split {split_name} is None."
+        model = self.unwrap_dist_model(self.model)
+        if not skip_reload and cur_epoch == "best":
+            model = self._reload_best_model(model)
+        model.eval()
+
+        self.before_evaluation(model=model, dataset=self.datasets[split_name])
+        results = self.evaluation(self.config, model, data_loader)
+
+        if results is not None:
+            return self.after_evaluation(self.config, results, split_name, cur_epoch)
+        return None
+
+    def unwrap_dist_model(self, model):
+        return model.module if isinstance(model, nn.DataParallel) else model
 
     @main_process
-    def _save_checkpoint(self, cur_epoch, is_best=False): # ----------------------------------------------------------------------------------
-        """
-        Save the checkpoint at the current epoch.
-        """
+    def _save_checkpoint(self, cur_epoch, is_best=False):
         model_no_ddp = self.unwrap_dist_model(self.model)
-        param_grad_dic = {
-            k: v.requires_grad for (k, v) in model_no_ddp.named_parameters()
+        state_dict = {
+            k: v for k, v in model_no_ddp.state_dict().items() if v.requires_grad
         }
-        state_dict = model_no_ddp.state_dict()
-        for k in list(state_dict.keys()):
-            if k in param_grad_dic.keys() and not param_grad_dic[k]:
-                # delete parameters that do not require gradient
-                del state_dict[k]
-
         save_obj = {
             "model": state_dict,
             "optimizer": self.optimizer.state_dict(),
@@ -692,114 +245,736 @@ class RunnerBaseW:
             "scaler": self.scaler.state_dict() if self.scaler else None,
             "epoch": cur_epoch,
         }
-        save_to = os.path.join(
-            self.output_dir,
-            "checkpoint_{}.pth".format("best" if is_best else cur_epoch),
-        )
-        logging.info("Saving checkpoint at epoch {} to {}.".format(cur_epoch, save_to))
-        torch.save(save_obj, save_to)
+        path = os.path.join(self.output_dir, f"checkpoint_{'best' if is_best else cur_epoch}.pth")
+        logging.info(f"Saving checkpoint at epoch {cur_epoch} to {path}.")
+        torch.save(save_obj, path)
 
     def _reload_best_model(self, model):
-        """
-        Load the best checkpoint for evaluation.
-        """
         checkpoint_path = os.path.join(self.output_dir, "checkpoint_best.pth")
-
-        logging.info("Loading checkpoint from {}.".format(checkpoint_path))
+        logging.info(f"Loading checkpoint from {checkpoint_path}.")
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
         try:
             model.load_state_dict(checkpoint["model"])
-        except RuntimeError as e:
-            logging.warning(
-                """
-                Key mismatch when loading checkpoint. This is expected if only part of the model is saved.
-                Trying to load the model with strict=False.
-                """
-            )
+        except:
             model.load_state_dict(checkpoint["model"], strict=False)
         return model
 
-
-    def _load_checkpoint(self, url_or_filename):
-        """
-        Resume from a checkpoint.
-        """
-        print(f"[DEBUG] Attempting to load checkpoint: {url_or_filename}")
-
-        if is_url(url_or_filename):
-            print("[DEBUG] Detected URL, downloading checkpoint...")
-            cached_file = download_cached_file(
-                url_or_filename, check_hash=False, progress=True
-            )
-            print(f"[DEBUG] Download complete. Loading checkpoint from cache: {cached_file}")
-            checkpoint = torch.load(cached_file, map_location=self.device)
-
-        elif os.path.isfile(url_or_filename):
-            print(f"[DEBUG] Found local checkpoint file: {url_or_filename}")
-            checkpoint = torch.load(url_or_filename, map_location=self.device)
-        else:
-            print("[ERROR] Checkpoint path is invalid.")
-            raise RuntimeError("checkpoint url or path is invalid")
-
-        print("[DEBUG] Checkpoint loaded successfully.")
-        print(f"[DEBUG] Keys in checkpoint: {list(checkpoint.keys())}")
-
-        state_dict = checkpoint["model"]
-        print("[DEBUG] Loading model state dict...")
-        # self.unwrap_dist_model(self.model).load_state_dict(state_dict)
-        missing_keys, unexpected_keys = self.unwrap_dist_model(self.model).load_state_dict(state_dict, strict=False)
-        print("[DEBUG] Missing keys:", missing_keys)
-        print("[DEBUG] Unexpected keys:", unexpected_keys)
-
-
-        print("[DEBUG] Loading optimizer state dict...")
+    def _load_checkpoint(self, path):
+        checkpoint = torch.load(path, map_location=self.device)
+        self.unwrap_dist_model(self.model).load_state_dict(checkpoint["model"], strict=False)
         self.optimizer.load_state_dict(checkpoint["optimizer"])
-
         if self.scaler and "scaler" in checkpoint:
-            print("[DEBUG] Loading AMP scaler state dict...")
             self.scaler.load_state_dict(checkpoint["scaler"])
-        else:
-            print("[DEBUG] No AMP scaler state found in checkpoint.")
-
         self.start_epoch = checkpoint["epoch"] + 1
-        print(f"[DEBUG] Resuming from epoch {self.start_epoch}")
-        logging.info("Resume checkpoint from {}".format(url_or_filename))
-
-
-    # def _load_checkpoint(self, url_or_filename): #----------------------------------------------------------------------------------
-    #     """
-    #     Resume from a checkpoint.
-    #     """
-    #     if is_url(url_or_filename):
-    #         cached_file = download_cached_file(
-    #             url_or_filename, check_hash=False, progress=True
-    #         )
-    #         checkpoint = torch.load(cached_file, map_location=self.device)
-    #     elif os.path.isfile(url_or_filename):
-    #         checkpoint = torch.load(url_or_filename, map_location=self.device)
-    #     else:
-    #         raise RuntimeError("checkpoint url or path is invalid")
-
-    #     state_dict = checkpoint["model"]
-    #     self.unwrap_dist_model(self.model).load_state_dict(state_dict)
-
-    #     self.optimizer.load_state_dict(checkpoint["optimizer"])
-    #     if self.scaler and "scaler" in checkpoint:
-    #         self.scaler.load_state_dict(checkpoint["scaler"])
-
-    #     self.start_epoch = checkpoint["epoch"] + 1
-    #     logging.info("Resume checkpoint from {}".format(url_or_filename))
 
     @main_process
     def log_stats(self, stats, split_name):
         if isinstance(stats, dict):
-            log_stats = {**{f"{split_name}_{k}": v for k, v in stats.items()}}
+            log_stats = {f"{split_name}_{k}": v for k, v in stats.items()}
             with open(os.path.join(self.output_dir, "log.txt"), "a") as f:
                 f.write(json.dumps(log_stats) + "\n")
-        elif isinstance(stats, list):
-            pass
 
     @main_process
-    def log_config(self): #----------------------------------------------------------------------------------
+    def log_config(self):
         with open(os.path.join(self.output_dir, "log.txt"), "a") as f:
             f.write(json.dumps(self.config.to_dict(), indent=4) + "\n")
+
+    def setup_output_dir(self):
+        lib_root = Path(registry.get_path("library_root"))
+        output_dir = lib_root / self.config.run_cfg.output_dir / self.job_id
+        result_dir = output_dir / "result"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        result_dir.mkdir(parents=True, exist_ok=True)
+        registry.register_path("result_dir", str(result_dir))
+        registry.register_path("output_dir", str(output_dir))
+        self.result_dir = result_dir
+        self.output_dir = output_dir
+
+    # Other properties remain the same as yours
+    @property
+    def cuda_enabled(self): return self.device.type == "cuda"
+    @property
+    def max_epoch(self): return int(self.config.run_cfg.max_epoch)
+    @property
+    def log_freq(self): return int(self.config.run_cfg.get("log_freq", 50))
+    @property
+    def save_freq(self): return int(self.config.run_cfg.get("save_freq", 5))
+    @property
+    def val_freq(self): return int(self.config.run_cfg.get("val_freq", 1))
+    @property
+    def save_last(self): return int(self.config.run_cfg.get("save_last", True))
+    @property
+    def init_lr(self): return float(self.config.run_cfg.init_lr)
+    @property
+    def min_lr(self): return float(self.config.run_cfg.min_lr)
+    @property
+    def accum_grad_iters(self): return int(self.config.run_cfg.get("accum_grad_iters", 1))
+    @property
+    def valid_splits(self): return self.config.run_cfg.get("valid_splits", [])
+    @property
+    def test_splits(self): return self.config.run_cfg.get("test_splits", [])
+    @property
+    def train_splits(self): return self.config.run_cfg.get("train_splits", [])
+    @property
+    def evaluate_only(self): return self.config.run_cfg.evaluate
+    @property
+    def resume_ckpt_path(self): return self.config.run_cfg.get("resume_ckpt_path", None)
+    @property
+    def use_dist_eval_sampler(self): return False
+
+
+
+
+
+
+    def build_model(self, cfg):
+        model_config = cfg.model_cfg
+        model_cls = registry.get_model_class(model_config.arch)
+        return model_cls.from_config(model_config)
+
+    def build_datasets(self, cfg):
+        datasets = dict()
+        datasets_config = cfg.datasets_cfg
+        # print("\n>>> [DEBUG] datasets_cfg-------------------------:", cfg.datasets_cfg)
+        assert len(datasets_config) > 0, "At least one dataset has to be specified."
+
+        for name in datasets_config:
+            dataset_config = datasets_config[name]
+            builder = registry.get_builder_class(name)(dataset_config)
+            dataset = builder.build_datasets()
+            datasets[name] = dataset
+
+        # print(">>> [DEBUG] Built datasets keys:", datasets.keys())
+        return datasets
+
+    # def train_step(self, model, samples):
+    #     output = model(samples)
+    #     loss_dict = {k: v for k, v in output.items() if "loss" in k}
+    #     return output["loss"], loss_dict
+
+
+    def train_step(self, model, samples):
+        output = model(samples)
+        raw_loss = output["loss"]
+
+        # Ensure it's a scalar (e.g. mean reduction)
+        if raw_loss.ndim != 0:
+            raw_loss = raw_loss.mean()
+
+        loss_dict = {k: v.mean().item() if v.ndim > 0 else v.item() for k, v in output.items() if "loss" in k}
+        return raw_loss, loss_dict
+
+
+
+    def valid_step(self,config, model, samples):
+        model.eval()
+        samples = prepare_sample(samples, cuda_enabled=True)
+
+        retrieval_eval = getattr(config.run_cfg, "retrieval_eval", False)
+        use_amp = True
+
+        with torch.no_grad():
+            with autocast("cuda", enabled=use_amp):
+                if retrieval_eval:
+                    # Only extract embeddings for retrieval
+                    features = model.forward_features(samples)
+                    rgb_feats = features["rgb_feats"]
+                    lidar_feats = features["lidar_feats"]
+                    # print("[DEBUG] rgb_feats type:", type(rgb_feats), "shape:", rgb_feats.shape if isinstance(rgb_feats, torch.Tensor) else "N/A")
+                    # print("[DEBUG] lidar_feats type:", type(lidar_feats), "shape:", lidar_feats.shape if isinstance(lidar_feats, torch.Tensor) else "N/A")
+
+                    return {"loss": None, "output": {"rgb_feats": rgb_feats, "lidar_feats": lidar_feats}}
+                else:
+                    # Use standard forward that returns loss
+                    output = model(samples)
+                    loss = output["loss"].item() if "loss" in output else None
+                    return {"loss": loss, "output": output}
+
+
+    def before_evaluation(self, model, dataset, **kwargs):
+        model.before_evaluation(dataset=dataset, task_type=type(self))
+
+
+
+    def after_evaluation(self, config, val_result, split_name, epoch):
+        """
+        Process the results after evaluation.
+
+        Args:
+            val_result (dict): a dict containing evaluation outputs (e.g., losses, metrics, retrieval stats).
+            split_name (str): name of the split evaluated.
+            epoch (int or str): epoch number or "best".
+
+        Returns:
+            dict: stats to log (should contain "loss" key at least, or retrieval metrics).
+        """
+        print("[AFTER_EVAL] Received val_result:", val_result)
+
+        stats = {
+            "epoch": epoch,
+            "split": split_name,
+        }
+
+        if isinstance(val_result, dict):
+            # Log loss if available
+            if "loss" in val_result:
+                stats["loss"] = val_result["loss"]
+
+            # Log general metrics if present
+            if "metrics" in val_result:
+                stats.update(val_result["metrics"])
+
+            # If retrieval evaluation results were added
+            if "output" in val_result and config.run_cfg.get("retrieval_eval", False):
+                retrieval_metrics = self.compute_retrieval_metrics_from_outputs(val_result["output"])
+                stats.update(retrieval_metrics)
+
+            if "retrieval" in val_result:
+                retrieval_metrics = val_result["retrieval"]
+                stats.update(retrieval_metrics)
+
+        print("[AFTER_EVAL] Returning stats:", stats)
+        return stats
+
+    @torch.no_grad()
+    def evaluation(self, config, model, data_loader, cuda_enabled=True):
+        metric_logger = MetricLogger(delimiter="  ")
+        header = "Evaluation"
+        print_freq = 10
+
+        total_loss = 0.0
+        num_batches = 0
+        all_outputs = []
+
+        retrieval_eval = getattr(config.run_cfg, "retrieval_eval", False)
+
+        for samples in metric_logger.log_every(data_loader, print_freq, header):
+            samples = prepare_sample(samples, cuda_enabled=cuda_enabled)
+            eval_output = self.valid_step(config, model=model, samples=samples)
+
+            if retrieval_eval:
+                all_outputs.append(eval_output)  # raw features
+            else:
+                loss = eval_output.get("loss", None)
+                output = eval_output.get("output", None)
+                if loss is not None:
+                    total_loss += loss
+                all_outputs.append(output)
+
+            num_batches += 1
+
+        if retrieval_eval:
+            return {
+                "output": all_outputs  # for computing Recall@K etc.
+            }
+        else:
+            avg_loss = total_loss / max(num_batches, 1)
+            return {
+                "loss": avg_loss,
+                "output": all_outputs,
+            }
+
+
+
+
+    def compute_retrieval_metrics_from_outputs(self, output_list, top_k=(1, 5, 10)):
+        rgb_feats_list = []
+        lidar_feats_list = []
+
+        for out in output_list:
+            inner_output = out["output"]
+            rgb_feats_list.append(inner_output["rgb_feats"])
+            lidar_feats_list.append(inner_output["lidar_feats"])
+
+        rgb_feats = torch.cat(rgb_feats_list, dim=0)      # [B_total, N, D]
+        lidar_feats = torch.cat(lidar_feats_list, dim=0)  # [B_total, N, D]
+
+        rgb_flat = rgb_feats.mean(dim=1)      # [B_total, D]
+        lidar_flat = lidar_feats.mean(dim=1)  # [B_total, D]
+
+        sim_matrix = torch.matmul(rgb_flat, lidar_flat.T)  # [B, B]
+
+        metrics = {}
+
+        # === Image-to-LiDAR ===
+        B = sim_matrix.size(0)
+        for k in top_k:
+            hits = sum([i in torch.topk(sim_matrix[i], k=k).indices for i in range(B)])
+            metrics[f"recall@{k}_rgb2lidar"] = hits / B
+
+        ranks = [(torch.argsort(sim_matrix[i], descending=True) == i).nonzero(as_tuple=True)[0].item() + 1 for i in range(B)]
+        metrics["mrr_rgb2lidar"] = sum(1.0 / rank for rank in ranks) / B
+
+        # === LiDAR-to-Image ===
+        sim_matrix_T = sim_matrix.T  # [B, B]
+        for k in top_k:
+            hits = sum([i in torch.topk(sim_matrix_T[i], k=k).indices for i in range(B)])
+            metrics[f"recall@{k}_lidar2rgb"] = hits / B
+
+        ranks = [(torch.argsort(sim_matrix_T[i], descending=True) == i).nonzero(as_tuple=True)[0].item() + 1 for i in range(B)]
+        metrics["mrr_lidar2rgb"] = sum(1.0 / rank for rank in ranks) / B
+
+        return metrics
+
+
+
+
+
+
+    
+
+
+    def _train_inner_loop(
+        self,
+        epoch,
+        iters_per_epoch,
+        model,
+        data_loader,
+        optimizer,
+        lr_scheduler,
+        scaler=None,
+        start_iters=None,
+        log_freq=50,
+        cuda_enabled=False,
+        accum_grad_iters=1,
+    ):
+        use_amp = scaler is not None
+
+        if not hasattr(data_loader, "__next__"):
+            data_loader = iter(data_loader)
+
+        metric_logger = MetricLogger(delimiter="  ")
+        metric_logger.add_meter("lr", SmoothedValue(window_size=1, fmt="{value:.6f}"))
+        metric_logger.add_meter("loss", SmoothedValue(window_size=1, fmt="{value:.4f}"))
+
+        logging.info(f"Start training epoch {epoch}, {iters_per_epoch} iters per inner epoch.")
+        header = f"Train: data epoch: [{epoch}]"
+        inner_epoch = epoch if start_iters is None else start_iters // iters_per_epoch
+        if start_iters is not None:
+            header += f"; inner epoch [{inner_epoch}]"
+        
+        for i in metric_logger.log_every(range(iters_per_epoch), log_freq, header):
+            if i >= iters_per_epoch:
+                break
+
+            samples = next(data_loader)
+            samples = prepare_sample(samples, cuda_enabled=cuda_enabled)
+            if samples is None or samples.get("is_empty", False):
+                continue
+            
+            if not isinstance(samples, dict):
+                samples = {"is_empty": True}
+
+            samples.update(
+                {
+                    "epoch": inner_epoch,
+                    "num_iters_per_epoch": iters_per_epoch,
+                    "iters": i,
+                }
+            )
+
+            lr_scheduler.step(cur_epoch=inner_epoch, cur_step=i)
+            print(f"[DEBUG] Step {i}, LR: {optimizer.param_groups[0]['lr']:.8f} -----------------------")
+
+
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                loss, loss_dict = self.train_step(model=model, samples=samples)
+                loss /= accum_grad_iters
+
+            if use_amp:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+
+            if (i + 1) % accum_grad_iters == 0:
+                if use_amp:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                optimizer.zero_grad()
+
+            metric_logger.update(**loss_dict)
+            metric_logger.update(lr=optimizer.param_groups[0]["lr"])
+
+        metric_logger.synchronize_between_processes()
+        logging.info("Averaged stats: " + str(metric_logger.global_avg()))
+        return {
+            # k: "{:.3f}".format(meter.global_avg)
+            k: ("{:.8f}".format(meter.global_avg) if k == "lr" else "{:.3f}".format(meter.global_avg))
+            for k, meter in metric_logger.meters.items()
+        }
+
+
+
+
+
+# def setup_task(cfg):
+#     assert "task" in cfg.run_cfg, "Task name must be provided."
+#     task_name = cfg.run_cfg.task
+#     # task = registry.get_task_class(task_name).setup_task(cfg=cfg)
+#     task = BaseTask()
+#     assert task is not None, f"Task {task_name} not properly registered."
+#     return task
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# import logging
+# import os
+# from torch import autocast
+# import torch
+
+# from lavis.common.logger import MetricLogger, SmoothedValue
+# from lavis.common.registry import registry
+# from lavis.datasets.data_utils import prepare_sample
+
+
+# class BaseTask:
+#     def __init__(self, **kwargs):
+#         super().__init__()
+#         self.inst_id_key = "instance_id"
+
+#     @classmethod
+#     def setup_task(cls, **kwargs):
+#         return cls()
+
+#     def build_model(self, cfg):
+#         model_config = cfg.model_cfg
+#         model_cls = registry.get_model_class(model_config.arch)
+#         return model_cls.from_config(model_config)
+
+#     def build_datasets(self, cfg):
+#         datasets = dict()
+#         datasets_config = cfg.datasets_cfg
+#         # print("\n>>> [DEBUG] datasets_cfg-------------------------:", cfg.datasets_cfg)
+#         assert len(datasets_config) > 0, "At least one dataset has to be specified."
+
+#         for name in datasets_config:
+#             dataset_config = datasets_config[name]
+#             builder = registry.get_builder_class(name)(dataset_config)
+#             dataset = builder.build_datasets()
+#             datasets[name] = dataset
+
+#         # print(">>> [DEBUG] Built datasets keys:", datasets.keys())
+#         return datasets
+
+#     # def train_step(self, model, samples):
+#     #     output = model(samples)
+#     #     loss_dict = {k: v for k, v in output.items() if "loss" in k}
+#     #     return output["loss"], loss_dict
+
+
+#     def train_step(self, model, samples):
+#         output = model(samples)
+#         raw_loss = output["loss"]
+
+#         # Ensure it's a scalar (e.g. mean reduction)
+#         if raw_loss.ndim != 0:
+#             raw_loss = raw_loss.mean()
+
+#         loss_dict = {k: v.mean().item() if v.ndim > 0 else v.item() for k, v in output.items() if "loss" in k}
+#         return raw_loss, loss_dict
+
+
+
+#     def valid_step(self,config, model, samples):
+#         model.eval()
+#         samples = prepare_sample(samples, cuda_enabled=True)
+
+#         retrieval_eval = getattr(config.run_cfg, "retrieval_eval", False)
+#         use_amp = True
+
+#         with torch.no_grad():
+#             with autocast("cuda", enabled=use_amp):
+#                 if retrieval_eval:
+#                     # Only extract embeddings for retrieval
+#                     features = model.forward_features(samples)
+#                     rgb_feats = features["rgb_feats"]
+#                     lidar_feats = features["lidar_feats"]
+#                     # print("[DEBUG] rgb_feats type:", type(rgb_feats), "shape:", rgb_feats.shape if isinstance(rgb_feats, torch.Tensor) else "N/A")
+#                     # print("[DEBUG] lidar_feats type:", type(lidar_feats), "shape:", lidar_feats.shape if isinstance(lidar_feats, torch.Tensor) else "N/A")
+
+#                     return {"loss": None, "output": {"rgb_feats": rgb_feats, "lidar_feats": lidar_feats}}
+#                 else:
+#                     # Use standard forward that returns loss
+#                     output = model(samples)
+#                     loss = output["loss"].item() if "loss" in output else None
+#                     return {"loss": loss, "output": output}
+
+
+#     def before_evaluation(self, model, dataset, **kwargs):
+#         model.before_evaluation(dataset=dataset, task_type=type(self))
+
+
+
+#     def after_evaluation(self, config, val_result, split_name, epoch):
+#         """
+#         Process the results after evaluation.
+
+#         Args:
+#             val_result (dict): a dict containing evaluation outputs (e.g., losses, metrics, retrieval stats).
+#             split_name (str): name of the split evaluated.
+#             epoch (int or str): epoch number or "best".
+
+#         Returns:
+#             dict: stats to log (should contain "loss" key at least, or retrieval metrics).
+#         """
+#         print("[AFTER_EVAL] Received val_result:", val_result)
+
+#         stats = {
+#             "epoch": epoch,
+#             "split": split_name,
+#         }
+
+#         if isinstance(val_result, dict):
+#             # Log loss if available
+#             if "loss" in val_result:
+#                 stats["loss"] = val_result["loss"]
+
+#             # Log general metrics if present
+#             if "metrics" in val_result:
+#                 stats.update(val_result["metrics"])
+
+#             # If retrieval evaluation results were added
+#             if "output" in val_result and config.run_cfg.get("retrieval_eval", False):
+#                 retrieval_metrics = self.compute_retrieval_metrics_from_outputs(val_result["output"])
+#                 stats.update(retrieval_metrics)
+
+#             if "retrieval" in val_result:
+#                 retrieval_metrics = val_result["retrieval"]
+#                 stats.update(retrieval_metrics)
+
+#         print("[AFTER_EVAL] Returning stats:", stats)
+#         return stats
+
+#     @torch.no_grad()
+#     def evaluation(self, config, model, data_loader, cuda_enabled=True):
+#         metric_logger = MetricLogger(delimiter="  ")
+#         header = "Evaluation"
+#         print_freq = 10
+
+#         total_loss = 0.0
+#         num_batches = 0
+#         all_outputs = []
+
+#         retrieval_eval = getattr(config.run_cfg, "retrieval_eval", False)
+
+#         for samples in metric_logger.log_every(data_loader, print_freq, header):
+#             samples = prepare_sample(samples, cuda_enabled=cuda_enabled)
+#             eval_output = self.valid_step(config, model=model, samples=samples)
+
+#             if retrieval_eval:
+#                 all_outputs.append(eval_output)  # raw features
+#             else:
+#                 loss = eval_output.get("loss", None)
+#                 output = eval_output.get("output", None)
+#                 if loss is not None:
+#                     total_loss += loss
+#                 all_outputs.append(output)
+
+#             num_batches += 1
+
+#         if retrieval_eval:
+#             return {
+#                 "output": all_outputs  # for computing Recall@K etc.
+#             }
+#         else:
+#             avg_loss = total_loss / max(num_batches, 1)
+#             return {
+#                 "loss": avg_loss,
+#                 "output": all_outputs,
+#             }
+
+
+
+
+#     def compute_retrieval_metrics_from_outputs(self, output_list, top_k=(1, 5, 10)):
+#         rgb_feats_list = []
+#         lidar_feats_list = []
+
+#         for out in output_list:
+#             inner_output = out["output"]
+#             rgb_feats_list.append(inner_output["rgb_feats"])
+#             lidar_feats_list.append(inner_output["lidar_feats"])
+
+#         rgb_feats = torch.cat(rgb_feats_list, dim=0)      # [B_total, N, D]
+#         lidar_feats = torch.cat(lidar_feats_list, dim=0)  # [B_total, N, D]
+
+#         rgb_flat = rgb_feats.mean(dim=1)      # [B_total, D]
+#         lidar_flat = lidar_feats.mean(dim=1)  # [B_total, D]
+
+#         sim_matrix = torch.matmul(rgb_flat, lidar_flat.T)  # [B, B]
+
+#         metrics = {}
+
+#         # === Image-to-LiDAR ===
+#         B = sim_matrix.size(0)
+#         for k in top_k:
+#             hits = sum([i in torch.topk(sim_matrix[i], k=k).indices for i in range(B)])
+#             metrics[f"recall@{k}_rgb2lidar"] = hits / B
+
+#         ranks = [(torch.argsort(sim_matrix[i], descending=True) == i).nonzero(as_tuple=True)[0].item() + 1 for i in range(B)]
+#         metrics["mrr_rgb2lidar"] = sum(1.0 / rank for rank in ranks) / B
+
+#         # === LiDAR-to-Image ===
+#         sim_matrix_T = sim_matrix.T  # [B, B]
+#         for k in top_k:
+#             hits = sum([i in torch.topk(sim_matrix_T[i], k=k).indices for i in range(B)])
+#             metrics[f"recall@{k}_lidar2rgb"] = hits / B
+
+#         ranks = [(torch.argsort(sim_matrix_T[i], descending=True) == i).nonzero(as_tuple=True)[0].item() + 1 for i in range(B)]
+#         metrics["mrr_lidar2rgb"] = sum(1.0 / rank for rank in ranks) / B
+
+#         return metrics
+
+
+
+
+
+#     def train_epoch(
+#         self,
+#         epoch,
+#         model,
+#         data_loader,
+#         optimizer,
+#         lr_scheduler,
+#         scaler=None,
+#         cuda_enabled=False,
+#         log_freq=50,
+#         accum_grad_iters=1,
+#     ):
+#         stats = self._train_inner_loop(
+#             epoch=epoch,
+#             iters_per_epoch=len(data_loader),
+#             model=model,
+#             data_loader=data_loader,
+#             optimizer=optimizer,
+#             scaler=scaler,
+#             lr_scheduler=lr_scheduler,
+#             log_freq=log_freq,
+#             cuda_enabled=cuda_enabled,
+#             accum_grad_iters=accum_grad_iters,
+#         )
+#         # Add epoch number to log
+#         # stats["epoch"] = epoch
+#         stats = {f"{k}": v for k, v in stats.items()}
+#         stats["epoch"] = epoch
+#         return stats
+    
+
+
+#     def _train_inner_loop(
+#         self,
+#         epoch,
+#         iters_per_epoch,
+#         model,
+#         data_loader,
+#         optimizer,
+#         lr_scheduler,
+#         scaler=None,
+#         start_iters=None,
+#         log_freq=50,
+#         cuda_enabled=False,
+#         accum_grad_iters=1,
+#     ):
+#         use_amp = scaler is not None
+
+#         if not hasattr(data_loader, "__next__"):
+#             data_loader = iter(data_loader)
+
+#         metric_logger = MetricLogger(delimiter="  ")
+#         metric_logger.add_meter("lr", SmoothedValue(window_size=1, fmt="{value:.6f}"))
+#         metric_logger.add_meter("loss", SmoothedValue(window_size=1, fmt="{value:.4f}"))
+
+#         logging.info(f"Start training epoch {epoch}, {iters_per_epoch} iters per inner epoch.")
+#         header = f"Train: data epoch: [{epoch}]"
+#         inner_epoch = epoch if start_iters is None else start_iters // iters_per_epoch
+#         if start_iters is not None:
+#             header += f"; inner epoch [{inner_epoch}]"
+        
+#         for i in metric_logger.log_every(range(iters_per_epoch), log_freq, header):
+#             if i >= iters_per_epoch:
+#                 break
+
+#             samples = next(data_loader)
+#             samples = prepare_sample(samples, cuda_enabled=cuda_enabled)
+#             if samples is None or samples.get("is_empty", False):
+#                 continue
+            
+#             if not isinstance(samples, dict):
+#                 samples = {"is_empty": True}
+
+#             samples.update(
+#                 {
+#                     "epoch": inner_epoch,
+#                     "num_iters_per_epoch": iters_per_epoch,
+#                     "iters": i,
+#                 }
+#             )
+
+#             lr_scheduler.step(cur_epoch=inner_epoch, cur_step=i)
+#             print(f"[DEBUG] Step {i}, LR: {optimizer.param_groups[0]['lr']:.8f} -----------------------")
+
+
+#             with torch.cuda.amp.autocast(enabled=use_amp):
+#                 loss, loss_dict = self.train_step(model=model, samples=samples)
+#                 loss /= accum_grad_iters
+
+#             if use_amp:
+#                 scaler.scale(loss).backward()
+#             else:
+#                 loss.backward()
+
+#             if (i + 1) % accum_grad_iters == 0:
+#                 if use_amp:
+#                     scaler.step(optimizer)
+#                     scaler.update()
+#                 else:
+#                     optimizer.step()
+#                 optimizer.zero_grad()
+
+#             metric_logger.update(**loss_dict)
+#             metric_logger.update(lr=optimizer.param_groups[0]["lr"])
+
+#         metric_logger.synchronize_between_processes()
+#         logging.info("Averaged stats: " + str(metric_logger.global_avg()))
+#         return {
+#             # k: "{:.3f}".format(meter.global_avg)
+#             k: ("{:.8f}".format(meter.global_avg) if k == "lr" else "{:.3f}".format(meter.global_avg))
+#             for k, meter in metric_logger.meters.items()
+#         }
+
+
+# ----------------------
+# Simple Task Setup
+# ----------------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

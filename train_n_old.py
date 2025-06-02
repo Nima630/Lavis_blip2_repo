@@ -8,9 +8,10 @@ from lavis.datasets.nuscenes import NuScenesDatasetBuilder
 # from lavis.models.blip2_models import blip2_qformer_n
 # from Lavis_blip2.lavis.models.blip2_qformer_n import Blip2Qformer 
 from lavis.models.blip2_qformer_n import Blip2Qformer 
-# from lavis.tasks.base_task_w import BaseTask
+from lavis.tasks.base_task_w import BaseTask
 from lavis.common.config_w import Config  # new config_w.py
-from lavis.common.dist_utils import is_main_process
+
+from lavis.common.dist_utils import get_rank, init_distributed_mode
 from lavis.common.logger import setup_logger
 from lavis.common.optims import (
     LinearWarmupCosineLRScheduler,
@@ -37,7 +38,7 @@ def parse_args():
     return parser.parse_args()
 
 def setup_seeds(config):
-    seed = config.run_cfg.seed 
+    seed = config.run_cfg.seed + get_rank()
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -51,6 +52,8 @@ def main():
     cfg = Config(args)
 
 
+    init_distributed_mode(cfg.run_cfg)
+    cfg.run_cfg.gpu = int(os.environ.get("LOCAL_RANK", 0))
     setup_seeds(cfg)
     setup_logger()
 
@@ -69,7 +72,7 @@ def main():
     print(cfg.run_cfg)
     print("cfg.run_cfg")
 
-    task = None #BaseTask()
+    task = BaseTask()
     builder = NuScenesDatasetBuilder(cfg)
 
 
@@ -97,84 +100,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# At the top of train_n.py
-class Trainer:
-    def __init__(self, cfg, model, datasets, job_id):
-        self.config = cfg
-        self.model = model
-        self.datasets = datasets
-        self.job_id = job_id
-        # Combine logic from __init__ of RunnerBaseW and BaseTask
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
