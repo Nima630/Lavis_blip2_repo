@@ -41,17 +41,17 @@ datasets:
 
       camera:
         train:
-          storage: lavis/my_datasets/nuscenes_dataset/train/camera_front_tiny
+          storage: lavis/my_datasets/nuscenes_dataset/train/camera_front #_tiny
         val:
-          storage: lavis/my_datasets/nuscenes_dataset/validation/camera_front_tiny
+          storage: lavis/my_datasets/nuscenes_dataset/validation/camera_front #_tiny
         test:
           storage: lavis/my_datasets/nuscenes_dataset/test/camera_front
 
       lidar:
         train:
-          storage: lavis/my_datasets/nuscenes_dataset/train/lidar_tiny
+          storage: lavis/my_datasets/nuscenes_dataset/train/lidar #_tiny
         val:
-          storage: lavis/my_datasets/nuscenes_dataset/validation/lidar_tiny
+          storage: lavis/my_datasets/nuscenes_dataset/validation/lidar #_tiny
         test:
           storage: lavis/my_datasets/nuscenes_dataset/test/lidar
 
@@ -68,7 +68,7 @@ run:
   warmup_lr: 1e-6
   # lr_layer_decay: 0.9 # uncomment this which not useing linear_warmup_cosine_lr
   weight_decay: 0.05
-  max_epoch: 1 #500 # 20
+  max_epoch: 500 # 20
   val_freq: 10 # evaluate every n epochs
   save_freq: 10 # n epochs (not used for now)
   batch_size_train: 4 #64 # 16
@@ -77,7 +77,7 @@ run:
   accum_grad_iters: 8 # batch_size_train x accum_grad_iters = effective batch size 
   warmup_steps: 4 #50 #20 #5
   seed: 42
-  output_dir: "output/BLIP2/qformer_scratch_nuscenes"
+  output_dir: "output/BLIP2/qformer_scratch_nuscenes_4_layers"
   amp:  true
   # only uncommented when resuming traning or when evaluate only (to only evaluate, set evaluate to true)
   # resume_ckpt_path: "lavis/output/BLIP2/qformer_scratch_nuscenes/20250429233/checkpoint_best.pth" 

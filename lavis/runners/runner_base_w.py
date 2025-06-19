@@ -28,12 +28,11 @@ from lavis.datasets.dataloader_utils import IterLoader, MultiIterLoader, Prefetc
 
 
 class RunnerBaseW:
-    def __init__(self, cfg, task, model, datasets, job_id):
+    def __init__(self, cfg, model, datasets, job_id):
         self.config = cfg
         self.datasets = datasets
         self._model = model
         self.job_id = job_id
-
         self._wrapped_model = None
         self._device = None
         self._optimizer = None
@@ -95,6 +94,13 @@ class RunnerBaseW:
             )
         return self._lr_sched
 
+
+    @property
+    def train_loader(self):
+        return self.dataloaders["train"]
+
+
+
     @property
     def dataloaders(self):
         if self._dataloaders is None:
@@ -120,6 +126,8 @@ class RunnerBaseW:
             self._dataloaders = {k: v for k, v in zip(sorted(self.datasets), dataloaders)}
         return self._dataloaders
 
+
+
     def create_loaders(self, datasets, num_workers, batch_sizes, is_trains, collate_fns, dataset_ratios=None):
         def _create_loader(dataset, num_workers, bsz, is_train, collate_fn):
             if isinstance(dataset, ChainDataset) or isinstance(dataset, wds.DataPipeline):
@@ -141,22 +149,23 @@ class RunnerBaseW:
 
         loaders = []
         for dataset, bsz, is_train, collate_fn in zip(datasets, batch_sizes, is_trains, collate_fns):
-            if isinstance(dataset, (list, tuple)):
-                loader = MultiIterLoader(
-                    loaders=[
-                        _create_loader(d, num_workers, bsz, is_train, collate_fn[i])
-                        for i, d in enumerate(dataset)
-                    ],
-                    ratios=dataset_ratios,
-                )
-            else:
-                loader = _create_loader(dataset, num_workers, bsz, is_train, collate_fn)
+            # if isinstance(dataset, (list, tuple)):
+            #     print(f"[DEBUG] Creating MultiIterLoader for dataset with {len(dataset)} components.")
+            #     loader = MultiIterLoader(
+            #         loaders=[
+            #             _create_loader(d, num_workers, bsz, is_train, collate_fn[i])
+            #             for i, d in enumerate(dataset)
+            #         ],
+            #         ratios=dataset_ratios,
+            #     )
+            # else:
+            print(f"[DEBUG] Creating single DataLoader for dataset {dataset}.")
+            loader = _create_loader(dataset, num_workers, bsz, is_train, collate_fn)
             loaders.append(loader)
         return loaders
 
-    @property
-    def train_loader(self):
-        return self.dataloaders["train"]
+
+
 
     def train(self):
         best_val_loss_so_far = float("inf")
@@ -222,7 +231,7 @@ class RunnerBaseW:
             model = self._reload_best_model(model)
         model.eval()
 
-        self.before_evaluation(model=model, dataset=self.datasets[split_name])
+        # self.before_evaluation(model=model, dataset=self.datasets[split_name])
         results = self.evaluation(self.config, model, data_loader)
 
         if results is not None:
@@ -391,134 +400,6 @@ class RunnerBaseW:
                     return {"loss": loss, "output": output}
 
 
-    def before_evaluation(self, model, dataset, **kwargs):
-        model.before_evaluation(dataset=dataset, task_type=type(self))
-
-
-
-    def after_evaluation(self, config, val_result, split_name, epoch):
-        """
-        Process the results after evaluation.
-
-        Args:
-            val_result (dict): a dict containing evaluation outputs (e.g., losses, metrics, retrieval stats).
-            split_name (str): name of the split evaluated.
-            epoch (int or str): epoch number or "best".
-
-        Returns:
-            dict: stats to log (should contain "loss" key at least, or retrieval metrics).
-        """
-        print("[AFTER_EVAL] Received val_result:", val_result)
-
-        stats = {
-            "epoch": epoch,
-            "split": split_name,
-        }
-
-        if isinstance(val_result, dict):
-            # Log loss if available
-            if "loss" in val_result:
-                stats["loss"] = val_result["loss"]
-
-            # Log general metrics if present
-            if "metrics" in val_result:
-                stats.update(val_result["metrics"])
-
-            # If retrieval evaluation results were added
-            if "output" in val_result and config.run_cfg.get("retrieval_eval", False):
-                retrieval_metrics = self.compute_retrieval_metrics_from_outputs(val_result["output"])
-                stats.update(retrieval_metrics)
-
-            if "retrieval" in val_result:
-                retrieval_metrics = val_result["retrieval"]
-                stats.update(retrieval_metrics)
-
-        print("[AFTER_EVAL] Returning stats:", stats)
-        return stats
-
-    @torch.no_grad()
-    def evaluation(self, config, model, data_loader, cuda_enabled=True):
-        metric_logger = MetricLogger(delimiter="  ")
-        header = "Evaluation"
-        print_freq = 10
-
-        total_loss = 0.0
-        num_batches = 0
-        all_outputs = []
-
-        retrieval_eval = getattr(config.run_cfg, "retrieval_eval", False)
-
-        for samples in metric_logger.log_every(data_loader, print_freq, header):
-            samples = prepare_sample(samples, cuda_enabled=cuda_enabled)
-            eval_output = self.valid_step(config, model=model, samples=samples)
-
-            if retrieval_eval:
-                all_outputs.append(eval_output)  # raw features
-            else:
-                loss = eval_output.get("loss", None)
-                output = eval_output.get("output", None)
-                if loss is not None:
-                    total_loss += loss
-                all_outputs.append(output)
-
-            num_batches += 1
-
-        if retrieval_eval:
-            return {
-                "output": all_outputs  # for computing Recall@K etc.
-            }
-        else:
-            avg_loss = total_loss / max(num_batches, 1)
-            return {
-                "loss": avg_loss,
-                "output": all_outputs,
-            }
-
-
-
-
-    def compute_retrieval_metrics_from_outputs(self, output_list, top_k=(1, 5, 10)):
-        rgb_feats_list = []
-        lidar_feats_list = []
-
-        for out in output_list:
-            inner_output = out["output"]
-            rgb_feats_list.append(inner_output["rgb_feats"])
-            lidar_feats_list.append(inner_output["lidar_feats"])
-
-        rgb_feats = torch.cat(rgb_feats_list, dim=0)      # [B_total, N, D]
-        lidar_feats = torch.cat(lidar_feats_list, dim=0)  # [B_total, N, D]
-
-        rgb_flat = rgb_feats.mean(dim=1)      # [B_total, D]
-        lidar_flat = lidar_feats.mean(dim=1)  # [B_total, D]
-
-        sim_matrix = torch.matmul(rgb_flat, lidar_flat.T)  # [B, B]
-
-        metrics = {}
-
-        # === Image-to-LiDAR ===
-        B = sim_matrix.size(0)
-        for k in top_k:
-            hits = sum([i in torch.topk(sim_matrix[i], k=k).indices for i in range(B)])
-            metrics[f"recall@{k}_rgb2lidar"] = hits / B
-
-        ranks = [(torch.argsort(sim_matrix[i], descending=True) == i).nonzero(as_tuple=True)[0].item() + 1 for i in range(B)]
-        metrics["mrr_rgb2lidar"] = sum(1.0 / rank for rank in ranks) / B
-
-        # === LiDAR-to-Image ===
-        sim_matrix_T = sim_matrix.T  # [B, B]
-        for k in top_k:
-            hits = sum([i in torch.topk(sim_matrix_T[i], k=k).indices for i in range(B)])
-            metrics[f"recall@{k}_lidar2rgb"] = hits / B
-
-        ranks = [(torch.argsort(sim_matrix_T[i], descending=True) == i).nonzero(as_tuple=True)[0].item() + 1 for i in range(B)]
-        metrics["mrr_lidar2rgb"] = sum(1.0 / rank for rank in ranks) / B
-
-        return metrics
-
-
-
-
 
 
     
@@ -604,6 +485,136 @@ class RunnerBaseW:
             k: ("{:.8f}".format(meter.global_avg) if k == "lr" else "{:.3f}".format(meter.global_avg))
             for k, meter in metric_logger.meters.items()
         }
+
+
+
+
+
+
+
+# ================================================================
+# Evaluation 
+# ================================================================
+   
+
+    def compute_retrieval_metrics_from_outputs(self, output_list, top_k=(1, 5, 10)):
+        rgb_feats_list = []
+        lidar_feats_list = []
+
+        for out in output_list:
+            inner_output = out["output"]
+            rgb_feats_list.append(inner_output["rgb_feats"])
+            lidar_feats_list.append(inner_output["lidar_feats"])
+
+        rgb_feats = torch.cat(rgb_feats_list, dim=0)      # [B_total, N, D]
+        lidar_feats = torch.cat(lidar_feats_list, dim=0)  # [B_total, N, D]
+
+        rgb_flat = rgb_feats.mean(dim=1)      # [B_total, D]
+        lidar_flat = lidar_feats.mean(dim=1)  # [B_total, D]
+
+        sim_matrix = torch.matmul(rgb_flat, lidar_flat.T)  # [B, B]
+
+        metrics = {}
+
+        # === Image-to-LiDAR ===
+        B = sim_matrix.size(0)
+        for k in top_k:
+            hits = sum([i in torch.topk(sim_matrix[i], k=k).indices for i in range(B)])
+            metrics[f"recall@{k}_rgb2lidar"] = hits / B
+
+        ranks = [(torch.argsort(sim_matrix[i], descending=True) == i).nonzero(as_tuple=True)[0].item() + 1 for i in range(B)]
+        metrics["mrr_rgb2lidar"] = sum(1.0 / rank for rank in ranks) / B
+
+        # === LiDAR-to-Image ===
+        sim_matrix_T = sim_matrix.T  # [B, B]
+        for k in top_k:
+            hits = sum([i in torch.topk(sim_matrix_T[i], k=k).indices for i in range(B)])
+            metrics[f"recall@{k}_lidar2rgb"] = hits / B
+
+        ranks = [(torch.argsort(sim_matrix_T[i], descending=True) == i).nonzero(as_tuple=True)[0].item() + 1 for i in range(B)]
+        metrics["mrr_lidar2rgb"] = sum(1.0 / rank for rank in ranks) / B
+
+        return metrics
+
+
+    @torch.no_grad()
+    def evaluation(self, config, model, data_loader, cuda_enabled=True):
+        metric_logger = MetricLogger(delimiter="  ")
+        header = "Evaluation"
+        print_freq = 10
+
+        total_loss = 0.0
+        num_batches = 0
+        all_outputs = []
+
+        retrieval_eval = getattr(config.run_cfg, "retrieval_eval", False)
+
+        for samples in metric_logger.log_every(data_loader, print_freq, header):
+            samples = prepare_sample(samples, cuda_enabled=cuda_enabled)
+            eval_output = self.valid_step(config, model=model, samples=samples)
+
+            if retrieval_eval:
+                all_outputs.append(eval_output)  # raw features
+            else:
+                loss = eval_output.get("loss", None)
+                output = eval_output.get("output", None)
+                if loss is not None:
+                    total_loss += loss
+                all_outputs.append(output)
+
+            num_batches += 1
+
+        if retrieval_eval:
+            return {
+                "output": all_outputs  # for computing Recall@K etc.
+            }
+        else:
+            avg_loss = total_loss / max(num_batches, 1)
+            return {
+                "loss": avg_loss,
+                "output": all_outputs,
+            }
+   
+   
+    def after_evaluation(self, config, val_result, split_name, epoch):
+        """
+        Process the results after evaluation.
+
+        Args:
+            val_result (dict): a dict containing evaluation outputs (e.g., losses, metrics, retrieval stats).
+            split_name (str): name of the split evaluated.
+            epoch (int or str): epoch number or "best".
+
+        Returns:
+            dict: stats to log (should contain "loss" key at least, or retrieval metrics).
+        """
+        print("[AFTER_EVAL] Received val_result:", val_result)
+
+        stats = {
+            "epoch": epoch,
+            "split": split_name,
+        }
+
+        if isinstance(val_result, dict):
+            # Log loss if available
+            if "loss" in val_result:
+                stats["loss"] = val_result["loss"]
+
+            # Log general metrics if present
+            if "metrics" in val_result:
+                stats.update(val_result["metrics"])
+
+            # If retrieval evaluation results were added
+            if "output" in val_result and config.run_cfg.get("retrieval_eval", False):
+                retrieval_metrics = self.compute_retrieval_metrics_from_outputs(val_result["output"])
+                stats.update(retrieval_metrics)
+
+            if "retrieval" in val_result:
+                retrieval_metrics = val_result["retrieval"]
+                stats.update(retrieval_metrics)
+
+        print("[AFTER_EVAL] Returning stats:", stats)
+        return stats
 
 
 

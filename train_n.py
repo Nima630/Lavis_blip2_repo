@@ -1,3 +1,7 @@
+
+
+
+
 import argparse
 import os
 import random
@@ -5,11 +9,9 @@ import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 from lavis.datasets.nuscenes import NuScenesDatasetBuilder
-# from lavis.models.blip2_models import blip2_qformer_n
-# from Lavis_blip2.lavis.models.blip2_qformer_n import Blip2Qformer 
+ 
 from lavis.models.blip2_qformer_n import Blip2Qformer 
-# from lavis.tasks.base_task_w import BaseTask
-from lavis.common.config_w import Config  # new config_w.py
+from lavis.common.config_w import Config  
 from lavis.common.dist_utils import is_main_process
 from lavis.common.logger import setup_logger
 from lavis.common.optims import (
@@ -41,7 +43,7 @@ def setup_seeds(config):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    cudnn.benchmark = False
+    cudnn.benchmark = False # fastest way to run yeild results that are a little random. So False means slower but more consistent
     cudnn.deterministic = True
 
 def main():
@@ -54,7 +56,6 @@ def main():
     setup_seeds(cfg)
     setup_logger()
 
-    # Manually register the paths previously set in lavis/tasks/__init__.py
     root_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lavis")
 
 
@@ -69,26 +70,26 @@ def main():
     print(cfg.run_cfg)
     print("cfg.run_cfg")
 
-    task = None #BaseTask()
     builder = NuScenesDatasetBuilder(cfg)
-
-
     datasets = builder.build_datasets()
 
-    print("passed check-------------------------------------")
     train_dataset = datasets.get("train")
 
     if train_dataset is None:
         raise ValueError("Train dataset not found in builder output.")
-
     print(">>> [DEBUG] Loaded train dataset with", len(train_dataset), "samples")
 
 
 
     model = Blip2Qformer.from_config(cfg.model_cfg)
+    print(">>> [DEBUG] Model loaded from config")   
+    # print(model)
+    with open("blip2qformer_model_structure.txt", "w") as f:
+        f.write(str(model))
+    # exit()
     if not cfg.run_cfg.amp:
         model = model.float()
-    runner = RunnerBaseW(cfg=cfg, job_id=job_id, task=task, model=model, datasets=datasets)
+    runner = RunnerBaseW(cfg=cfg, job_id=job_id, model=model, datasets=datasets)
     if len(train_dataset) == 0:
         raise RuntimeError("Train dataset is empty. Check your input paths or data content.")
 
@@ -97,84 +98,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# At the top of train_n.py
-class Trainer:
-    def __init__(self, cfg, model, datasets, job_id):
-        self.config = cfg
-        self.model = model
-        self.datasets = datasets
-        self.job_id = job_id
-        # Combine logic from __init__ of RunnerBaseW and BaseTask
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

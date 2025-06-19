@@ -21,21 +21,12 @@ class TorchCameraDataset:
 
         return {
             "image": image,
-            "image_id": os.path.basename(path)
+            "image_id": os.path.splitext(os.path.basename(path))[0]
+
         }
 
     def __len__(self):
         return len(self.camera_files)
-
-    def collater(self, samples):
-        samples = [s for s in samples if s is not None]
-        if len(samples) == 0:
-            return {}
-        return {
-            k: torch.stack([s[k] for s in samples]) if isinstance(samples[0][k], torch.Tensor) else [s[k] for s in samples]
-            for k in samples[0]
-        }
-
 
 
 
@@ -54,20 +45,42 @@ class TorchLidarDataset:
 
         return {
             "lidar": lidar,
-            "image_id": os.path.basename(path)
+            "image_id": os.path.splitext(os.path.basename(path))[0]
         }
 
     def __len__(self):
         return len(self.lidar_files)
 
-    def collater(self, samples):
-        samples = [s for s in samples if s is not None]
-        if len(samples) == 0:
-            return {}
-        return {
-            k: torch.stack([s[k] for s in samples]) if isinstance(samples[0][k], torch.Tensor) else [s[k] for s in samples]
-            for k in samples[0]
-        }
+
+
+# class WrappedConcatDataset(ConcatDataset):
+#     def __init__(self, datasets):
+#         assert len(datasets) == 2
+#         super().__init__(datasets)
+#         self.camera_dataset = datasets[0]
+#         self.lidar_dataset = datasets[1]
+
+#     def __getitem__(self, idx):
+#         if idx >= len(self.camera_dataset) or idx >= len(self.lidar_dataset):
+#             return None
+#         cam_sample = self.camera_dataset[idx]
+#         lidar_sample = self.lidar_dataset[idx]
+#         if cam_sample is None or lidar_sample is None:
+#             return None
+#         return {**cam_sample, **lidar_sample, "label": 1}
+
+#     def __len__(self):
+#         return min(len(self.camera_dataset), len(self.lidar_dataset))
+
+#     def collater(self, samples):
+#         samples = [s for s in samples if s is not None]
+#         if len(samples) == 0:
+#             return {}
+#         batch = self.camera_dataset.collater(samples)
+#         batch.update({"lidar": torch.stack([s["lidar"] for s in samples])})
+#         batch["label"] = torch.tensor([s["label"] for s in samples])
+#         return batch
+
 
 
 class WrappedConcatDataset(ConcatDataset):
@@ -76,7 +89,10 @@ class WrappedConcatDataset(ConcatDataset):
         super().__init__(datasets)
         self.camera_dataset = datasets[0]
         self.lidar_dataset = datasets[1]
+        self.length = min(len(self.camera_dataset), len(self.lidar_dataset))
 
+    def __len__(self):
+        return self.length
     def __getitem__(self, idx):
         if idx >= len(self.camera_dataset) or idx >= len(self.lidar_dataset):
             return None
@@ -84,21 +100,62 @@ class WrappedConcatDataset(ConcatDataset):
         lidar_sample = self.lidar_dataset[idx]
         if cam_sample is None or lidar_sample is None:
             return None
-        return {**cam_sample, **lidar_sample, "label": 1}
+        return {
+            **cam_sample,
+            **lidar_sample,
+            "label": 1  # or use some logic if label varies
+        }
 
-    def __len__(self):
-        return min(len(self.camera_dataset), len(self.lidar_dataset))
-
-    def collater(self, samples):
+    def collater(self, samples):   
         samples = [s for s in samples if s is not None]
         if len(samples) == 0:
             return {}
-        batch = self.camera_dataset.collater(samples)
-        batch.update({"lidar": torch.stack([s["lidar"] for s in samples])})
-        batch["label"] = torch.tensor([s["label"] for s in samples])
-        return batch
+
+        output = {}
+        keys = samples[0].keys()
+        
+        for k in keys:
+            values = [s[k] for s in samples]
+            first = values[0]
+
+            if isinstance(first, torch.Tensor):
+                output[k] = torch.stack(values)
+            elif isinstance(first, (int, float)):
+                output[k] = torch.tensor(values)
+            else:
+                output[k] = values
+
+        return output
+
+    # def collater(self, samples):   
+    #     samples = [s for s in samples if s is not None]
+    #     print(f"[DEBUG collater] {len(samples)} samples")
+
+    #     if len(samples) == 0:
+    #         print("[DEBUG collater] No valid samples — returning empty dict")
+    #         return {}
+
+    #     output = {}
+    #     keys = samples[0].keys()
+    #     for k in keys:
+    #         values = [s[k] for s in samples]
+    #         first = values[0]
+
+    #         if isinstance(first, torch.Tensor):
+    #             output[k] = torch.stack(values)
+    #         elif isinstance(first, (int, float)):
+    #             output[k] = torch.tensor(values)
+    #         else:
+    #             output[k] = values
+
+    #         print(f"[DEBUG collater] Key: {k}, type: {type(first)}, shape: {getattr(first, 'shape', None)}")
+
+    #     print("[DEBUG collater] Final output keys:", output.keys())
+    #     return output
 
 
+
+# creates train/val/test splits from config
 class NuScenesDatasetBuilder:
     def __init__(self, cfg):
         self.config = cfg
@@ -138,97 +195,85 @@ def get_matched_files(camera_root, lidar_root):
 
     return matched_camera_files, matched_lidar_files
 
+
+import os
+import argparse
+from torch.utils.data import DataLoader
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+
+
+# def main():
+#     parser = argparse.ArgumentParser()
+#     parser.add_argument("--base-path", required=True, help="Path to the nuscenes_dataset/train/tiny folder")
+#     args = parser.parse_args()
+
+#     camera_root = os.path.join(args.base_path, "camera_front_tiny") # if tiny dataset folders exist 
+#     lidar_root = os.path.join(args.base_path, "lidar_tiny")
+
+#     cam_files, lidar_files = get_matched_files(camera_root, lidar_root)
+#     print(f"[INFO] Matched {len(cam_files)} camera and {len(lidar_files)} lidar files")
+
+#     cam_dataset = TorchCameraDataset(cam_files)
+#     lidar_dataset = TorchLidarDataset(lidar_files)
+#     dataset = WrappedConcatDataset([cam_dataset, lidar_dataset])
+#     loader = DataLoader(dataset, batch_size=4, shuffle=False, collate_fn=dataset.collater)
+
+#     for batch in loader:
+#         print("[BATCH]")
+#         for k, v in batch.items():
+#             if isinstance(v, torch.Tensor):
+#                 print(f"{k}: shape {v.shape}")
+#             else:
+#                 print(f"{k}: {v}")
+#         break
+
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--base-path", required=True, help="Path to the nuscenes_dataset/train/tiny folder")
+    args = parser.parse_args()
+
+    camera_root = os.path.join(args.base_path, "camera_front")
+    lidar_root = os.path.join(args.base_path, "lidar")
+
+    cam_files, lidar_files = get_matched_files(camera_root, lidar_root)
+    print(f"[INFO] Matched {len(cam_files)} camera and {len(lidar_files)} lidar files")
+
+    cam_dataset = TorchCameraDataset(cam_files)
+    lidar_dataset = TorchLidarDataset(lidar_files)
+    print(f"Camera dataset length: {len(cam_dataset)}")
+    print(f"Lidar dataset length: {len(lidar_dataset)}")
+
+    dataset = WrappedConcatDataset([cam_dataset, lidar_dataset])
+    print(f"[DEBUG] Total paired dataset length: {len(dataset)}")
+
+    loader = DataLoader(dataset, batch_size=4, shuffle=False, collate_fn=dataset.collater)
+
+    total = 0
+    skipped = 0
+
+    for i, batch in enumerate(loader):
+        total += 1
+        if not batch:
+            print(f"[WARNING] Skipped batch {i} — empty dict returned.")
+            skipped += 1
+            continue
+
+        print(f"[BATCH {i}]")
+        for k, v in batch.items():
+            if isinstance(v, torch.Tensor):
+                print(f"{k}: shape {v.shape}")
+            else:
+                print(f"{k}: {v}")
+            # break
+        break
+    print(f"\n[SUMMARY] Total batches: {total}, Skipped (empty): {skipped}, Valid: {total - skipped}")
+
+
 if __name__ == "__main__":
-    import os
-
-    # === Simulate config structure with classes ===
-    class DummyStorage:
-        def __init__(self, path):
-            self.storage = path
-
-    class DummySplit:
-        def __init__(self, camera_path, lidar_path):
-            self.camera = {"train": DummyStorage(camera_path)}
-            self.lidar = {"train": DummyStorage(lidar_path)}
-
-    class DummyNuscenesConfig:
-        def __init__(self, camera_path, lidar_path):
-            self.build_info = {
-                "camera": {"train": DummyStorage(camera_path)},
-                "lidar": {"train": DummyStorage(lidar_path)}
-            }
-
-            # Mimic the nested OmegaConf-style object
-            self.vis_processor = None  # Optional: for future use
-
-    class DummyCfg:
-        class RunCfg:
-            train_splits = ["train"]
-            valid_splits = []
-            test_splits = []
-
-        def __init__(self, camera_path, lidar_path):
-            self.run_cfg = DummyCfg.RunCfg()
-            self.datasets_cfg = {
-                "nuscenes": DummyNuscenesConfig(camera_path, lidar_path)
-            }
-
-    # === Define correct data paths relative to nuscenes.py ===
-    data_root = os.path.join(os.path.dirname(__file__), "../my_datasets/nuscenes_dataset/train")
-    camera_data_path = os.path.join(data_root, "camera_front")
-    lidar_data_path = os.path.join(data_root, "lidar")
-
-    # === Create dummy config
-    cfg = DummyCfg(camera_data_path, lidar_data_path)
-
-    # === Use your dataset builder
-    builder = NuScenesDatasetBuilder(cfg)
-    datasets = builder.build_datasets()
-
-    # === Access and test train split
-    dataset = datasets.get("train")
-    print(f"[INFO] Dataset has {len(dataset)} matched samples.")
-
-    sample = dataset[0]
-    if sample:
-        print(f"[SAMPLE] Image ID: {sample['image_id']}")
-        print(f"[SAMPLE] Camera tensor shape: {sample['image'].shape}")
-        print(f"[SAMPLE] LiDAR tensor shape: {sample['lidar'].shape}")
-    else:
-        print("[WARNING] Sample 0 is None.")
-
-
-# import torch
-# import pprint
-
-# # Change these paths to actual files
-# cam_path = "../my_datasets/nuscenes_dataset/train/camera_front/000cf4dfaab54d21a7314036fde74966.pt"
-# lidar_path = "../my_datasets/nuscenes_dataset/train/lidar/000cf4dfaab54d21a7314036fde74966.pt"
-
-# pp = pprint.PrettyPrinter(indent=2)
-
-# print("[Camera PT]")
-# cam_data = torch.load(cam_path)
-# print(type(cam_data))
-# if isinstance(cam_data, dict):
-#     print("Keys:", cam_data.keys())
-#     if "meta" in cam_data:
-#         print("Meta info:")
-#         pp.pprint(cam_data["meta"])
-#     else:
-#         print("No 'meta' key found in camera file.")
-# else:
-#     print("Camera .pt file is not a dict, got:", cam_data.shape if hasattr(cam_data, 'shape') else cam_data)
-
-# print("\n[LiDAR PT]")
-# lidar_data = torch.load(lidar_path)
-# print(type(lidar_data))
-# if isinstance(lidar_data, dict):
-#     print("Keys:", lidar_data.keys())
-#     if "meta" in lidar_data:
-#         print("Meta info:")
-#         pp.pprint(lidar_data["meta"])
-#     else:
-#         print("No 'meta' key found in lidar file.")
-# else:
-#     print("LiDAR .pt file is not a dict, got:", lidar_data.shape if hasattr(lidar_data, 'shape') else lidar_data)
+    main()
+    
+# run the main with 
+# python lavis/datasets/nuscenes.py --base-path lavis/my_datasets/nuscenes_dataset/train

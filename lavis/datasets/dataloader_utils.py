@@ -149,6 +149,7 @@ class PrefetchLoader_(object):
     def preload(self, it):
         try:
             self.batch = next(it)
+            # print("[PrefetchLoader debug] Got batch:", self.batch) 
             # print(f"[PrefetchLoader DEBUG] Preloaded batch keys: {list(self.batch.keys()) if isinstance(self.batch, dict) else type(self.batch)}")
         except StopIteration:
             self.batch = None

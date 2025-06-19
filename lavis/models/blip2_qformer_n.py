@@ -168,15 +168,15 @@ def concat_all_gather(tensor): # -----------------------------------------------
     return tensor
 
 
-def tile(x, dim, n_tile):
-    init_dim = x.size(dim)
-    repeat_idx = [1] * x.dim()
-    repeat_idx[dim] = n_tile
-    x = x.repeat(*(repeat_idx))
-    order_index = torch.LongTensor(
-        np.concatenate([init_dim * np.arange(n_tile) + i for i in range(init_dim)])
-    )
-    return torch.index_select(x, dim, order_index.to(x.device))
+# def tile(x, dim, n_tile):
+#     init_dim = x.size(dim)
+#     repeat_idx = [1] * x.dim()
+#     repeat_idx[dim] = n_tile
+#     x = x.repeat(*(repeat_idx))
+#     order_index = torch.LongTensor(
+#         np.concatenate([init_dim * np.arange(n_tile) + i for i in range(init_dim)])
+#     )
+#     return torch.index_select(x, dim, order_index.to(x.device))
 
 
 
@@ -331,8 +331,9 @@ class BlipOutputWithLogits(BlipOutput):
 class Blip2Base(BaseModel):
     @classmethod
     def init_Qformer(cls, num_query_token, vision_width, cross_attention_freq=2):
-        print("[TRACE] init_Qformer in blip2.py")
+        # print("[TRACE] init_Qformer in blip2.py")
         encoder_config = BertConfig.from_pretrained("bert-base-uncased")
+        encoder_config.num_hidden_layers = 4 #6 
         encoder_config.encoder_width = vision_width
         encoder_config.add_cross_attention = True
         encoder_config.cross_attention_freq = cross_attention_freq
@@ -360,7 +361,7 @@ class Blip2Qformer(Blip2Base):
         vit_precision="fp16",
         freeze_vit=True,
         num_query_token=32,
-        cross_attention_freq=2,
+        cross_attention_freq=1,
         embed_dim=256,
         max_txt_len=32,
     ):
@@ -397,6 +398,11 @@ class Blip2Qformer(Blip2Base):
         image = samples["image"]
         lidar = samples["lidar"]
         bs = image.size(0)
+        # print("[MODEL DEBUG] Forward input keys:", list(samples.keys()))
+        # for k, v in samples.items():
+        #     if isinstance(v, torch.Tensor):
+        #         print(f" - {k}: {tuple(v.shape)}")
+
 
         rgb_feat = image.squeeze(1)
         rgb_proj = self.rgb_input_proj(rgb_feat)
@@ -426,11 +432,12 @@ class Blip2Qformer(Blip2Base):
         )
         lidar_feats = F.normalize(self.lidar_proj(lidar_output.last_hidden_state), dim=-1)
 
-        rgb_feats_all = concat_all_gather(rgb_feats)
-        lidar_feats_all = concat_all_gather(lidar_feats)
-        B, N, D = rgb_feats_all.shape
+        # rgb_feats_all = concat_all_gather(rgb_feats)
+        # lidar_feats_all = concat_all_gather(lidar_feats)
 
-        dot_products = torch.einsum('bnd,tmd->btmn', rgb_feats_all, lidar_feats_all)
+        B, N, D = rgb_feats.shape
+
+        dot_products = torch.einsum('bnd,tmd->btmn', rgb_feats, lidar_feats)
         sim_rgb2lidar = dot_products.max(dim=-1).values.mean(dim=-1)
         sim_lidar2rgb = dot_products.max(dim=-2).values.mean(dim=-1)
         targets = torch.arange(B).to(sim_rgb2lidar.device)
