@@ -1,6 +1,6 @@
 Blip2Qformer(
   (rgb_input_proj): Sequential(
-    (0): Conv2d(2048, 768, kernel_size=(1, 1), stride=(1, 1))
+    (0): Conv2d(256, 768, kernel_size=(1, 1), stride=(1, 1))
     (1): BatchNorm2d(768, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
   )
   (lidar_input_proj): Sequential(
