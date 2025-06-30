@@ -39,21 +39,27 @@ datasets:
           test:
             storage: lavis/my_datasets/nuscenes_dataset/nuscenes_lidar_annotations_test.json
 
+    
       camera:
         train:
-          storage: lavis/my_datasets/nuscenes_dataset_multi_cam_tiny/train_fpn #_tiny
+          storage: lavis/my_datasets/nuscenes_dataset_multi_cam_fpn/train 
+          # storage: lavis/my_datasets/nuscenes_dataset_multi_cam_tiny/train_fpn #_tiny
         val:
-          storage: lavis/my_datasets/nuscenes_dataset_multi_cam_tiny/train_fpn #_tiny
+          storage: lavis/my_datasets/nuscenes_dataset_multi_cam_fpn/validation #_tiny
+          # storage: lavis/my_datasets/nuscenes_dataset_multi_cam_tiny/train_fpn #_tiny
         test:
           storage: lavis/my_datasets/nuscenes_dataset_multi_cam_tiny/test
 
       lidar:
         train:
-          storage: lavis/my_datasets/nuscenes_dataset_multi_cam_tiny/train_fpn/lidar #_tiny
+          storage: lavis/my_datasets/nuscenes_dataset_multi_cam_fpn/train/lidar #_tiny
+          # storage: lavis/my_datasets/nuscenes_dataset_multi_cam_tiny/train_fpn/lidar #_tiny
         val:
-          storage: lavis/my_datasets/nuscenes_dataset_multi_cam_tiny/train_fpn/lidar #_tiny
+          storage: lavis/my_datasets/nuscenes_dataset_multi_cam_fpn/validation/lidar #_tiny
+          # storage: lavis/my_datasets/nuscenes_dataset_multi_cam_tiny/train_fpn/lidar #_tiny
         test:
           storage: lavis/my_datasets/nuscenes_dataset_multi_cam_tiny/test/lidar
+
 
 
 
@@ -68,16 +74,16 @@ run:
   warmup_lr: 1e-6
   # lr_layer_decay: 0.9 # uncomment this which not useing linear_warmup_cosine_lr
   weight_decay: 0.05
-  max_epoch: 1 #500 # 20
-  val_freq: 1 #10 # evaluate every n epochs
+  max_epoch: 200 # 20
+  val_freq: 10 # evaluate every n epochs
   save_freq: 10 # n epochs (not used for now)
-  batch_size_train: 1 #4 #64 # 16
-  batch_size_eval: 1 #2 #1 #16 #64
+  batch_size_train: 4 #64 # 16
+  batch_size_eval: 2 #1 #16 #64
   num_workers: 4
   accum_grad_iters: 8 # batch_size_train x accum_grad_iters = effective batch size 
   warmup_steps: 4 #50 #20 #5
   seed: 42
-  output_dir: "output/BLIP2/qformer_nuscenes_multi_cam"
+  output_dir: "output/BLIP2/qformer_scratch_nuscenes_4_layers"
   amp:  true
   # only uncommented when resuming traning or when evaluate only (to only evaluate, set evaluate to true)
   # resume_ckpt_path: "lavis/output/BLIP2/qformer_scratch_nuscenes/20250429233/checkpoint_best.pth" 

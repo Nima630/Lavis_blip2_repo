@@ -383,94 +383,94 @@ class Blip2Qformer(Blip2Base):
         )
 
 
-    def forward(self, samples): #, is_train=True):
-        image = samples["bev_image"]
-        lidar = samples["lidar"]
-        bs = image.size(0)
+    # def forward(self, samples): #, is_train=True):
+    #     image = samples["bev_image"]
+    #     lidar = samples["lidar"]
+    #     bs = image.size(0)
 
-        rgb_feat = image.squeeze(1)
-        # print("rgb_feat:", rgb_feat.shape)
-        rgb_proj = self.rgb_input_proj(rgb_feat)
-        # print("rgb_proj:", rgb_proj.shape)
-        rgb_embeds = rgb_proj.flatten(2).transpose(1, 2)
-        # print("rgb_embeds:", rgb_embeds.shape)
-        rgb_atts = torch.ones(rgb_embeds.size()[:-1], dtype=torch.long).to(image.device)
-        query_tokens = self.query_tokens.expand(bs, -1, -1)
-        # print("query_tokens:", query_tokens.shape)
+    #     rgb_feat = image.squeeze(1)
+    #     # print("rgb_feat:", rgb_feat.shape)
+    #     rgb_proj = self.rgb_input_proj(rgb_feat)
+    #     # print("rgb_proj:", rgb_proj.shape)
+    #     rgb_embeds = rgb_proj.flatten(2).transpose(1, 2)
+    #     # print("rgb_embeds:", rgb_embeds.shape)
+    #     rgb_atts = torch.ones(rgb_embeds.size()[:-1], dtype=torch.long).to(image.device)
+    #     query_tokens = self.query_tokens.expand(bs, -1, -1)
+    #     # print("query_tokens:", query_tokens.shape)
 
-        rgb_output = self.Qformer.bert(
-            query_embeds=query_tokens,
-            encoder_hidden_states=rgb_embeds,
-            encoder_attention_mask=rgb_atts,
-            return_dict=True,
-        )
-        # print("rgb_output.last_hidden_state:", rgb_output.last_hidden_state.shape)
-        rgb_feats = F.normalize(self.vision_proj(rgb_output.last_hidden_state), dim=-1)
-        # print("rgb_feats:", rgb_feats.shape)
+    #     rgb_output = self.Qformer.bert(
+    #         query_embeds=query_tokens,
+    #         encoder_hidden_states=rgb_embeds,
+    #         encoder_attention_mask=rgb_atts,
+    #         return_dict=True,
+    #     )
+    #     # print("rgb_output.last_hidden_state:", rgb_output.last_hidden_state.shape)
+    #     rgb_feats = F.normalize(self.vision_proj(rgb_output.last_hidden_state), dim=-1)
+    #     # print("rgb_feats:", rgb_feats.shape)
 
-        lidar_feat = lidar.squeeze(1)
-        # print("lidar_feat:", lidar_feat.shape)
-        lidar_proj = self.lidar_input_proj(lidar_feat)
-        # print("lidar_proj:", lidar_proj.shape)
-        lidar_embeds = lidar_proj.flatten(2).transpose(1, 2)
-        # print("lidar_embeds:", lidar_embeds.shape)
-        lidar_atts = torch.ones(lidar_embeds.size()[:-1], dtype=torch.long).to(lidar.device)
-        query_tokens_lidar = self.query_tokens_lidar.expand(bs, -1, -1)
-        # print("query_tokens_lidar:", query_tokens_lidar.shape)
+    #     lidar_feat = lidar.squeeze(1)
+    #     # print("lidar_feat:", lidar_feat.shape)
+    #     lidar_proj = self.lidar_input_proj(lidar_feat)
+    #     # print("lidar_proj:", lidar_proj.shape)
+    #     lidar_embeds = lidar_proj.flatten(2).transpose(1, 2)
+    #     # print("lidar_embeds:", lidar_embeds.shape)
+    #     lidar_atts = torch.ones(lidar_embeds.size()[:-1], dtype=torch.long).to(lidar.device)
+    #     query_tokens_lidar = self.query_tokens_lidar.expand(bs, -1, -1)
+    #     # print("query_tokens_lidar:", query_tokens_lidar.shape)
 
-        lidar_output = self.Qformer_lidar.bert(
-            query_embeds=query_tokens_lidar,
-            encoder_hidden_states=lidar_embeds,
-            encoder_attention_mask=lidar_atts,
-            return_dict=True,
-        )
-        # print("lidar_output.last_hidden_state:", lidar_output.last_hidden_state.shape)
-        lidar_feats = F.normalize(self.lidar_proj(lidar_output.last_hidden_state), dim=-1)
-        # print("lidar_feats:", lidar_feats.shape)
+    #     lidar_output = self.Qformer_lidar.bert(
+    #         query_embeds=query_tokens_lidar,
+    #         encoder_hidden_states=lidar_embeds,
+    #         encoder_attention_mask=lidar_atts,
+    #         return_dict=True,
+    #     )
+    #     # print("lidar_output.last_hidden_state:", lidar_output.last_hidden_state.shape)
+    #     lidar_feats = F.normalize(self.lidar_proj(lidar_output.last_hidden_state), dim=-1)
+    #     # print("lidar_feats:", lidar_feats.shape)
 
-        B, M, D = lidar_feats.shape
-        _, N, _ = rgb_feats.shape
+    #     B, M, D = lidar_feats.shape
+    #     _, N, _ = rgb_feats.shape
 
-        # print("lidar_feats:", lidar_feats.shape)   # [B, M, D]
-        # print("rgb_feats:", rgb_feats.shape)       # [B, N, D]
+    #     # print("lidar_feats:", lidar_feats.shape)   # [B, M, D]
+    #     # print("rgb_feats:", rgb_feats.shape)       # [B, N, D]
 
-        temperature = 0.1
-        logits = torch.einsum('bmd,bnd->bmn', lidar_feats, rgb_feats)  # [B, M, N]
-        # print("logits:", logits.shape)
+    #     temperature = 0.1
+    #     logits = torch.einsum('bmd,bnd->bmn', lidar_feats, rgb_feats)  # [B, M, N]
+    #     # print("logits:", logits.shape)
 
-        is_train = samples.get("is_train", True)
+    #     is_train = samples.get("is_train", True)
         
-        rgb_feats = rgb_feats[torch.randperm(B)]
-        all_rgb_feats = rgb_feats.reshape(1, B * N, D).expand(B, -1, -1)  # [B, B*N, D]
-        # print("all_rgb_feats:", all_rgb_feats.shape)
+    #     rgb_feats = rgb_feats[torch.randperm(B)]
+    #     all_rgb_feats = rgb_feats.reshape(1, B * N, D).expand(B, -1, -1)  # [B, B*N, D]
+    #     # print("all_rgb_feats:", all_rgb_feats.shape)
        
 
-        lidar_feats_flat = lidar_feats.reshape(B * M, D)  # [B*M, D]
-        # print("lidar_feats_flat:", lidar_feats_flat.shape)
+    #     lidar_feats_flat = lidar_feats.reshape(B * M, D)  # [B*M, D]
+    #     # print("lidar_feats_flat:", lidar_feats_flat.shape)
 
-        logits_all = torch.matmul(lidar_feats_flat, all_rgb_feats.transpose(1, 2).reshape(B * D, B * N))
-        # print("intermediate logits_all:", logits_all.shape)
+    #     logits_all = torch.matmul(lidar_feats_flat, all_rgb_feats.transpose(1, 2).reshape(B * D, B * N))
+    #     # print("intermediate logits_all:", logits_all.shape)
 
-        logits_all = logits_all.view(B, M, B, N).permute(0, 2, 1, 3).reshape(B * M, B * N)  # [B*M, B*N]
-        # print("reshaped logits_all:", logits_all.shape)
+    #     logits_all = logits_all.view(B, M, B, N).permute(0, 2, 1, 3).reshape(B * M, B * N)  # [B*M, B*N]
+    #     # print("reshaped logits_all:", logits_all.shape)
 
-        pos_mask = torch.eye(B, device=lidar_feats.device).unsqueeze(1).repeat(1, M, N).reshape(B * M, B * N)
-        # print("pos_mask:", pos_mask.shape)
+    #     pos_mask = torch.eye(B, device=lidar_feats.device).unsqueeze(1).repeat(1, M, N).reshape(B * M, B * N)
+    #     # print("pos_mask:", pos_mask.shape)
 
-        loss_token = F.cross_entropy(logits_all / temperature, pos_mask.argmax(dim=1))
-        # print("loss_token:", loss_token)
-        pred = logits_all.argmax(dim=1)
-        acc = (pred == pos_mask.argmax(dim=1)).float().mean()
-        print("Token match accuracy:", acc.item())
+    #     loss_token = F.cross_entropy(logits_all / temperature, pos_mask.argmax(dim=1))
+    #     # print("loss_token:", loss_token)
+    #     pred = logits_all.argmax(dim=1)
+    #     acc = (pred == pos_mask.argmax(dim=1)).float().mean()
+    #     print("Token match accuracy:", acc.item())
 
-        print("logits_all stats — min:", logits_all.min().item(), " max:", logits_all.max().item(), " mean:", logits_all.mean().item())
-        diag_logits = logits_all[torch.eye(B*M, dtype=torch.bool)]
-        off_diag_logits = logits_all[~torch.eye(B*M, dtype=torch.bool)]
+    #     print("logits_all stats — min:", logits_all.min().item(), " max:", logits_all.max().item(), " mean:", logits_all.mean().item())
+    #     diag_logits = logits_all[torch.eye(B*M, dtype=torch.bool)]
+    #     off_diag_logits = logits_all[~torch.eye(B*M, dtype=torch.bool)]
 
-        print("Mean diag logits:", diag_logits.mean().item())
-        print("Mean off-diag logits:", off_diag_logits.mean().item())
+    #     print("Mean diag logits:", diag_logits.mean().item())
+    #     print("Mean off-diag logits:", off_diag_logits.mean().item())
 
-        return BlipOutput(loss=loss_token)
+    #     return BlipOutput(loss=loss_token)
 
 
 
