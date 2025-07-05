@@ -52,10 +52,10 @@ datasets:
 
       lidar:
         train:
-          storage: lavis/my_datasets/nuscenes_dataset_multi_cam_fpn/train/lidar #_tiny
+          storage: lavis/my_datasets/nuscenes_dataset_multi_cam/train/lidar #_tiny
           # storage: lavis/my_datasets/nuscenes_dataset_multi_cam_tiny/train_fpn/lidar #_tiny
         val:
-          storage: lavis/my_datasets/nuscenes_dataset_multi_cam_fpn/validation/lidar #_tiny
+          storage: lavis/my_datasets/nuscenes_dataset_multi_cam/validation/lidar #_tiny
           # storage: lavis/my_datasets/nuscenes_dataset_multi_cam_tiny/train_fpn/lidar #_tiny
         test:
           storage: lavis/my_datasets/nuscenes_dataset_multi_cam_tiny/test/lidar
